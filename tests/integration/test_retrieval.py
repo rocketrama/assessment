@@ -4,8 +4,6 @@ The corpus mirrors the spec's scenario: v1 / v2 / outdated FAQ / regional
 addendum / future v3, plus manager-only and HR-only documents.
 """
 
-import json
-import re
 from datetime import date
 
 import pytest
@@ -18,45 +16,16 @@ from app.ingestion.pipeline import run_ingestion
 from app.llm.client import CORPUS_TOKEN_LIMIT, LLMClient
 from app.retrieval.retriever import Retriever
 from tests.conftest import HashingEmbedder
+from tests.fixtures.policy_corpus import DOCS, RegexFactProvider, write_corpus
 
 TODAY = date(2026, 9, 15)
-
-# doc_id: (doc_type, regions, effective_date, access_level, sentence)
-DOCS = {
-    "POL-V1": ("policy", ["GLOBAL"], "2025-01-01", "all", "Staff get 10 days of sick leave each year."),
-    "POL-V2": ("policy", ["GLOBAL"], "2026-04-01", "all", "Staff get 12 days of sick leave each year."),
-    "FAQ": ("faq", ["GLOBAL"], "2026-05-01", "all", "Staff get 10 days of sick leave each year."),
-    "ADD-DE": ("addendum", ["DE"], "2025-06-01", "all", "Staff get 30 days of sick leave each year."),
-    "POL-V3": ("policy", ["GLOBAL"], "2027-01-01", "all", "Staff get 14 days of sick leave each year."),
-    "HB-MGR": ("handbook", ["GLOBAL"], "2026-01-01", "managers", "Confidential approval matrix: managers grant 7 days of sick leave extensions."),
-    "HR-BANDS": ("policy", ["GLOBAL"], "2026-01-01", "hr", "Confidential salary bands: band L3 pays 9 days of sick leave top-up."),
-}
-
-
-class RegexFactProvider:
-    """A fake extraction model: one fact per '<N> days of <x> leave' phrase."""
-
-    def chat(self, model, system, user, max_tokens, timeout):
-        facts = []
-        for chunk_id, body in re.findall(r'<document id="([^"]+)">\n(.*?)\n</document>', user, re.DOTALL):
-            for m in re.finditer(r"(\d+) days of (\w+ leave)", body):
-                facts.append({"chunk_id": chunk_id, "topic": m.group(2), "attribute": "days per year",
-                              "value": m.group(1), "unit": "days", "conditions": None, "quote": m.group(0)})
-        return json.dumps({"facts": facts})
 
 
 @pytest.fixture(scope="module")
 def retriever(tmp_path_factory):
     root = tmp_path_factory.mktemp("retrieval")
-    corpus = root / "corpus"
-    corpus.mkdir()
-    manifest = []
-    for doc_id, (doc_type, regions, effective, access, sentence) in DOCS.items():
-        (corpus / f"{doc_id}.md").write_text(f"# {doc_id}\n\n## Sick leave\n\n{sentence}\n", encoding="utf-8")
-        manifest.append({"doc_id": doc_id, "file": f"{doc_id}.md", "title": doc_id, "doc_type": doc_type,
-                         "regions": regions, "effective_date": effective, "access_level": access})
-    (root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
-    settings = Settings(_env_file=None, corpus_dir=str(corpus), manifest_path=str(root / "manifest.json"),
+    corpus, manifest = write_corpus(root)
+    settings = Settings(_env_file=None, corpus_dir=str(corpus), manifest_path=str(manifest),
                         cache_dir=str(root / "cache"))
     report = run_ingestion(settings, PageOcr(vision=None, use_tesseract=False),
                            llm=LLMClient(RegexFactProvider(), "fake"), embedder=HashingEmbedder())

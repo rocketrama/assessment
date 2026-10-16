@@ -1,0 +1,115 @@
+"""Date phrases (TASK.pdf §8.4). APP_TODAY in tests is Tuesday 2026-09-15."""
+
+from datetime import date
+
+import pytest
+
+from app.orchestration.dates import DateError, resolve_date, resolve_range, resolve_reference_date
+
+TODAY = date(2026, 9, 15)  # Tuesday
+D = date.fromisoformat
+
+
+@pytest.mark.parametrize(
+    "phrase, expected",
+    [
+        ("2026-09-21", "2026-09-21"),
+        ("21 September", "2026-09-21"),  # no year → 2026
+        ("21st of September", "2026-09-21"),
+        ("September 21", "2026-09-21"),
+        ("Sept 21, 2026", "2026-09-21"),
+        ("21/09/2026", "2026-09-21"),
+        ("21.9", "2026-09-21"),
+        ("today", "2026-09-15"),
+        ("tomorrow", "2026-09-16"),
+        ("next Friday", "2026-09-18"),  # first Friday after today
+        ("Friday", "2026-09-18"),
+        ("this Friday", "2026-09-18"),
+        ("next Tuesday", "2026-09-22"),  # today's weekday with "next" → a week on
+        ("next Monday", "2026-09-21"),
+    ],
+)
+def test_resolve_date(phrase, expected):
+    assert resolve_date(phrase, TODAY) == D(expected)
+
+
+@pytest.mark.parametrize(
+    "phrase, reason",
+    [
+        ("03/04", "ambiguous"),  # 3 April or March 4th?
+        ("Tuesday", "ambiguous"),  # said on a Tuesday: today or next week?
+        ("soon", "not_understood"),
+        ("the week after Diwali", "not_understood"),
+        ("31 February", "not_understood"),
+        ("", "not_understood"),
+    ],
+)
+def test_resolve_date_asks_when_unclear(phrase, reason):
+    with pytest.raises(DateError) as exc:
+        resolve_date(phrase, TODAY)
+    assert exc.value.reason == reason
+
+
+def test_past_dates_rejected_only_when_asked():
+    assert resolve_date("1 September", TODAY) == D("2026-09-01")
+    with pytest.raises(DateError) as exc:
+        resolve_date("1 September", TODAY, allow_past=False)
+    assert exc.value.reason == "past"
+
+
+def span(r):
+    return (r.start, r.end)
+
+
+def test_next_week_is_monday_to_friday_of_the_following_week():
+    assert span(resolve_range("next week", None, TODAY)) == (D("2026-09-21"), D("2026-09-25"))
+    assert span(resolve_range("next week", "next week", TODAY)) == (D("2026-09-21"), D("2026-09-25"))
+    sunday = date(2026, 9, 20)
+    assert resolve_range("next week", None, sunday).start == D("2026-09-21")
+
+
+def test_ranges():
+    assert span(resolve_range("21 September", "25 September", TODAY)) == (D("2026-09-21"), D("2026-09-25"))
+    assert span(resolve_range("next Monday", None, TODAY)) == (D("2026-09-21"), D("2026-09-21"))
+    # "Friday" is the 18th, before the 21st: the user must say what they mean.
+    with pytest.raises(DateError):
+        resolve_range("21 September", "Friday", TODAY)
+
+
+def test_range_ending_before_start_without_years_is_ambiguous():
+    with pytest.raises(DateError):
+        resolve_range("28 December", "2 January", TODAY)
+
+
+@pytest.mark.parametrize(
+    "phrase, expected",
+    [
+        ("2025", "2025-12-31"),
+        ("in 2025", "2025-12-31"),
+        ("last year", "2025-12-31"),
+        ("March 2025", "2025-03-31"),
+        ("1 August 2025", "2025-08-01"),
+        ("2026", None),  # current year → today applies
+        ("2027", None),  # future → upcoming changes, not a reference date
+        ("next year", None),
+        (None, None),
+    ],
+)
+def test_reference_date(phrase, expected):
+    assert resolve_reference_date(phrase, TODAY) == (D(expected) if expected else None)
+
+
+@pytest.mark.parametrize(
+    "message, phrases",
+    [
+        ("Who in my team is on leave next week?", ["next week"]),
+        ("Anyone off from 21 September to 25th September 2026?", ["21 September", "25th September 2026"]),
+        ("team leave next Friday please", ["next Friday"]),
+        ("between 2026-10-01 and 2026-10-05", ["2026-10-01", "2026-10-05"]),
+        ("What's the policy?", []),
+    ],
+)
+def test_find_date_phrases(message, phrases):
+    from app.orchestration.dates import find_date_phrases
+
+    assert find_date_phrases(message) == phrases

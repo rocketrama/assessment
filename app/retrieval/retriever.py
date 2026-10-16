@@ -33,7 +33,8 @@ class RetrievalResult:
     reference_date: date
     hits: tuple[SearchHit, ...]  # current-eligible hits only
     resolutions: tuple[RuleResolution, ...]
-    context: PackedContext
+    ordered_chunk_ids: tuple[str, ...]  # priority order, before packing
+    context: PackedContext  # packed with the full budget (the composer repacks around the rule table)
     allowed_chunks: int
 
 
@@ -82,7 +83,7 @@ class Retriever:
         )
         ordered = self._context_order(current_hits, resolutions, allowed, upcoming)
         return RetrievalResult(
-            reference_date, current_hits, resolutions, pack_context(ordered, corpus.chunks), len(allowed)
+            reference_date, current_hits, resolutions, tuple(ordered), pack_context(ordered, corpus.chunks), len(allowed)
         )
 
     def _context_order(

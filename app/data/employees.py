@@ -58,6 +58,21 @@ def get_contact(conn: sqlite3.Connection, employee_id: str) -> Contact | None:
     return Contact(row["employee_id"], row["full_name"], mask_email(row["email"]))
 
 
+def find_by_name(conn: sqlite3.Connection, name: str) -> list[Employee]:
+    """Employees whose full name matches `name` (case-insensitive): the whole name,
+    or every word of `name` appearing in the full name ("Priya" → "Priya Nair").
+    Returns identities only; the caller filters by what the requester may see."""
+    words = name.casefold().split()
+    if not words:
+        return []
+    matches = []
+    for row in conn.execute(f"SELECT {_EMPLOYEE_COLUMNS}, full_name FROM employees ORDER BY employee_id"):
+        full = row["full_name"].casefold()
+        if full == " ".join(words) or all(w in full.split() for w in words):
+            matches.append(Employee(**{k: row[k] for k in row.keys() if k != "full_name"}))
+    return matches
+
+
 def known_names(conn: sqlite3.Connection) -> list[str]:
     """Every full name, for the log redaction filter only."""
     return [r["full_name"] for r in conn.execute("SELECT full_name FROM employees")]

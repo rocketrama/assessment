@@ -16,10 +16,12 @@ from app.api.schemas import ChatRequest, ChatResponse
 from app.config import Settings, get_settings
 from app.data.db import connect, init_app_tables
 from app.data.employees import Employee, get_employee, known_names
-from app.data.sessions import SessionOwnershipError, claim_session
+from app.data.sessions import SessionOwnershipError, add_message, claim_session
 from app.ingestion.cache import cache_db_path
 from app.ingestion.pipeline import run_ingestion
+from app.llm.client import LLMClient
 from app.llm.embeddings import Embedder
+from app.orchestration.orchestrator import Turn, handle_turn
 from app.logging_setup import configure_logging
 from app.privacy.log_filter import PII_FILTER
 from app.retrieval.retriever import Retriever
@@ -32,15 +34,18 @@ class AppState:
         self.ready = False
         self.error: str | None = None
         self.retriever: Retriever | None = None
+        self.llm: LLMClient | None = None
 
 
 def create_app(
     settings: Settings | None = None,
     ingest: Callable[[Settings], None] = run_ingestion,
+    llm: LLMClient | None = None,
 ) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level, settings.log_format)
     state = AppState()
+    state.llm = llm or LLMClient.from_settings(settings)
 
     def _startup() -> None:
         if not os.path.isfile(settings.db_path):
@@ -118,12 +123,23 @@ def create_app(
                 )
                 raise HTTPException(status_code=403, detail="session belongs to another employee")
 
-        # Orchestration arrives in step 6; until then a contract-valid placeholder.
-        response = ChatResponse(
-            request_id=request_id,
-            answer="The assistant is not fully available yet.",
-            route="no_answer",
-        )
+            turn = Turn(
+                settings=settings,
+                conn=conn,
+                requester=requester,
+                session_id=body.session_id,
+                message=body.message,
+                today=settings.today(),
+                llm=state.llm,
+                retriever=state.retriever,
+                cache_db=cache_db_path(settings.cache_dir),
+            )
+            result = handle_turn(turn, request_id)
+            response = result.response
+            # Short history for the next turn's planner: the user's text and our answer.
+            add_message(conn, body.session_id, "user", body.message)
+            add_message(conn, body.session_id, "assistant", response.answer)
+
         # IDs and counts only; the message and answer text are never logged.
         log.info(
             "chat handled",
@@ -132,7 +148,7 @@ def create_app(
                 "employee_id": requester.employee_id,
                 "route": response.route,
                 "tool_calls": [t.name for t in response.tool_calls],
-                "corpus_tokens": 0,
+                "corpus_tokens": result.corpus_tokens,
                 "latency_ms": round((time.perf_counter() - started) * 1000, 1),
             },
         )

@@ -50,3 +50,8 @@ def test_strip_phones_keeps_dates_ids_and_amounts(text):
 def test_redact_contacts_handles_both():
     text = "Reach e.in@veltrix.example on +00-000-0004."
     assert redact_contacts(text) == f"Reach e***@veltrix.example on {PHONE_REMOVED}."
+
+
+def test_closing_bracket_after_a_phone_is_kept():
+    assert strip_phones("(call +91 98765 43210)") == f"(call {PHONE_REMOVED})"
+    assert strip_phones("call (415) 555-0100 now") == f"call {PHONE_REMOVED} now"

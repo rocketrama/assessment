@@ -37,10 +37,16 @@ def _is_phone(candidate: str) -> bool:
     return candidate.startswith("+") or bool(_SEPARATOR_RE.search(candidate)) or digits >= 10
 
 
+def _replace_phone(m: re.Match) -> str:
+    candidate = m.group()
+    if not _is_phone(candidate):
+        return candidate
+    # A closing bracket without an opening one belongs to the sentence: "(… +91 98765 43210)".
+    return PHONE_REMOVED + ")" if candidate.endswith(")") and "(" not in candidate else PHONE_REMOVED
+
+
 def strip_phones(text: str) -> str:
-    return _PHONE_CANDIDATE_RE.sub(
-        lambda m: PHONE_REMOVED if _is_phone(m.group()) else m.group(), text
-    )
+    return _PHONE_CANDIDATE_RE.sub(_replace_phone, text)
 
 
 def redact_contacts(text: str) -> str:
