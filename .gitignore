@@ -1,8 +1,9 @@
-# Reviewers supply their own ./data (TASK.pdf §10.1, §11.2); it may contain personal data
-data/
+# Reviewers supply their own ./data (TASK.pdf §10.1, §11.2); it may contain personal data.
+# Anchored with a leading slash so it doesn't also match the app/data/ package.
+/data/
 
 # Ingestion cache and index: corpus-derived, rebuilt at startup, never committed (§4.1)
-cache/
+/cache/
 *.db
 *.faiss
 
