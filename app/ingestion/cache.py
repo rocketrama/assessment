@@ -4,7 +4,7 @@
   parser version and OCR engines — never by file name, so a modified corpus
   file with the same name is always re-read (must-pass #5). Each entry carries a
   checksum; an entry that fails it is recomputed, never loaded.
-- `documents` / `chunks` / `holidays`: the current corpus, rebuilt in one transaction on every
+- `documents` / `chunks` / `holidays` / `facts`: the current corpus, rebuilt in one transaction on every
   startup with manifest metadata read fresh, so a stale cache can never mask an
   access-level change.
 
@@ -22,12 +22,13 @@ from datetime import datetime, timezone
 
 from app.ingestion.blocks import Block, ParsedDocument
 from app.ingestion.chunker import Chunk
+from app.ingestion.extract_facts import Fact
 from app.ingestion.extract_holidays import Holiday
 from app.ingestion.manifest import ManifestEntry
 
 log = logging.getLogger("veltrix.ingestion")
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -71,9 +72,23 @@ CREATE TABLE IF NOT EXISTS holidays (
     office_closed INTEGER NOT NULL,
     PRIMARY KEY (doc_id, region, date, name)
 );
+CREATE TABLE IF NOT EXISTS facts (
+    fact_id    TEXT PRIMARY KEY,
+    chunk_id   TEXT NOT NULL REFERENCES chunks(chunk_id),
+    doc_id     TEXT NOT NULL REFERENCES documents(doc_id),
+    rule_key   TEXT NOT NULL,
+    topic      TEXT NOT NULL,
+    attribute  TEXT NOT NULL,
+    value      TEXT NOT NULL,
+    unit       TEXT,
+    conditions TEXT,
+    quote      TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_facts_rule ON facts(rule_key);
+CREATE INDEX IF NOT EXISTS idx_facts_chunk ON facts(chunk_id);
 """
 
-_TABLES = ("meta", "parse_cache", "documents", "chunks", "holidays")
+_TABLES = ("meta", "parse_cache", "fact_cache", "documents", "chunks", "holidays", "facts")
 
 
 def cache_db_path(cache_dir: str) -> str:
@@ -143,10 +158,12 @@ def replace_corpus(
     documents: list[tuple[ManifestEntry, str]],
     chunks: list[Chunk],
     holidays: list[Holiday],
+    facts: list[Fact] = (),
 ) -> None:
-    """Swap in the current documents, chunks and holidays atomically."""
+    """Swap in the current documents, chunks, holidays and facts atomically."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DELETE FROM facts")
         conn.execute("DELETE FROM holidays")
         conn.execute("DELETE FROM chunks")
         conn.execute("DELETE FROM documents")
@@ -189,6 +206,13 @@ def replace_corpus(
         conn.executemany(
             "INSERT OR IGNORE INTO holidays VALUES (?, ?, ?, ?, ?)",
             [(h.doc_id, h.region, h.date.isoformat(), h.name, int(h.office_closed)) for h in holidays],
+        )
+        conn.executemany(
+            "INSERT INTO facts VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                (f.fact_id, f.chunk_id, f.doc_id, f.rule_key, f.topic, f.attribute, f.value, f.unit, f.conditions, f.quote)
+                for f in facts
+            ],
         )
         conn.execute("COMMIT")
     except BaseException:

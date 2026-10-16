@@ -65,7 +65,7 @@ def cache_db(tmp_path):
         cache_dir=str(tmp_path / "cache"),
     )
     report = run_ingestion(settings, PageOcr(vision=None, use_tesseract=False))
-    assert report.warnings == []
+    assert [w for w in report.warnings if "no LLM configured" not in w] == []
     return cache_db_path(settings.cache_dir)
 
 

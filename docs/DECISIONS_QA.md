@@ -889,9 +889,9 @@ Chaining example — each neighbour is similar: "annual leave allowance" ~ "annu
 | Tighter threshold (average) | Blocks **all** merges a bit more, good ones included — blunt |
 | Complete linkage | Blocks merges only where some member is far from the rest — the pattern of a chained over-merge — targeted |
 
-Order: read the ingestion report to see **why** it over-merged → a chain → complete linkage; a generally loose threshold → tighten it; close calls → LLM yes/no check for near-threshold pairs. Switch only on **evidence** (a cluster mixing different rules in the report, or a wrong winner in an eval case), never in advance. Implementation: `scipy.cluster.hierarchy` — `linkage(X, method="average", metric="cosine")` + `fcluster(Z, t, criterion="distance")` — trivial at ~150–300 facts, deterministic with fixed input order; run **within each (unit, conditions) partition** (see below).
+Order: read the ingestion report to see **why** it over-merged → a chain → complete linkage; a generally loose threshold → tighten it; close calls → LLM yes/no check for near-threshold pairs. Switch only on **evidence** (a cluster mixing different rules in the report, or a wrong winner in an eval case), never in advance. Implementation: average linkage on cosine distance with a distance threshold (`ingestion/rule_keys.py::average_linkage_labels`, numpy) — trivial at ~150–300 facts, deterministic with fixed input order; run **within each (unit, conditions) partition** (see below).
 
-*Why agglomerative clustering, and why scipy:*
+*Why agglomerative clustering:*
 
 | Need | Agglomerative | K-means | DBSCAN | HDBSCAN |
 |---|---|---|---|---|
@@ -904,11 +904,13 @@ Order: read the ingestion report to see **why** it over-merged → a chain → c
 
 Key rows: unknown number of rules, many groups of just 2 facts, chaining must be avoided → only agglomerative with average linkage meets all three.
 
-**scipy, not sklearn:** sklearn isn't otherwise in the stack and pulls in scipy anyway; `scipy.cluster.hierarchy` does exactly the same (`linkage` + `fcluster`) and draws the dendrogram. Minimal-stack choice (TECH_STACK principle). Don't hand-write it — tested library code.
+**Implementation — numpy, not scipy (changed during the build):** the plan was `scipy.cluster.hierarchy` (`linkage` + `fcluster`) as tested library code. On the development machine Windows Application Control blocked scipy's compiled modules (`DLL load failed … An Application Control policy has blocked this file`), so the same algorithm is implemented in ~25 lines of numpy: Lance–Williams average linkage, merging while the closest pair is within the threshold. Trade-off accepted because it is small, deterministic and unit-tested (merges close pairs, does **not** chain where single linkage would, cannot-link survives merges), and it removes a heavy dependency from the image. It also made **cannot-link** constraints easy (see below).
+
+**Cannot-link (added after measuring):** a document states each rule once, so two facts from the **same document** with **different keys** are never merged (their distance is set to infinity; average linkage keeps it infinite after merges). Without it, "primary caregiver weeks" and "secondary caregiver weeks" merged at every threshold tried — their keys embed almost identically.
 
 **Hard constraints before clustering, not after:** first **partition** facts by `(unit, conditions)`, then cluster **within each partition**. Incompatible facts can never share a group; splitting afterwards could leave odd fragments, and averaging distances across groups that should never merge distorts the result.
 
-*DESIGN.md line:* "Rule keys are clustered hierarchically (scipy, average linkage, cosine distance, distance threshold) because the number of rules is unknown, many rule groups are just two versions, and chaining must be avoided — ruling out k-means, DBSCAN and HDBSCAN. Facts are first partitioned by unit and conditions, so incompatible facts can never merge."
+*DESIGN.md line:* "Rule keys are clustered hierarchically (average linkage, cosine distance, distance threshold, same-document cannot-link) because the number of rules is unknown, many rule groups are just two versions, and chaining must be avoided — ruling out k-means, DBSCAN and HDBSCAN. Facts are first partitioned by unit and conditions, so incompatible facts can never merge."
 
 *The threshold value — **to be measured**, not chosen in advance:*
 
@@ -923,10 +925,12 @@ How to choose it (defensible method):
 6. Validate with eval known-conflict cases and by reading the clusters in the ingestion report.
 
 Practical notes:
-- The scipy `fcluster` threshold `t` (with `criterion="distance"`) is a **distance**: with `metric="cosine"` it is `1 − similarity` (similarity 0.88 → `t=0.12`).
+- The threshold is a **distance**: `1 − cosine similarity` (similarity 0.88 → `t=0.12`).
 - With average linkage the threshold applies to the **mean** distance between groups, not one pair.
 - Configurable via `RULE_CLUSTER_THRESHOLD` with a documented default (add to `.env.example`).
 - **Don't tune it to maximize the eval score** — that overfits our corpus; choose from the gap, then check against the eval.
+
+**Measured (2026-10-16, 245–317 facts, gpt-oss-20b extraction, bge-small keys):** 0.12 merged only same-rule facts across documents (e.g. carry-forward maximum across global v1/v2/v3, the three addenda, FAQ and wiki; sick-leave days per year across v1/v2/v3, FAQ, wiki and the DE addendum). 0.15 added correct merges (v1/v2 bereavement, parental leave) **and** a wrong one (sick-leave credit date with annual-leave accrual credit date); 0.20 merged clearly different rules (unpaid leave maximum with carry-forward maximum). A topic-similarity guard was tested and rejected: "sick leave" vs "annual leave" (0.230) sits between correct pairs (0.223, 0.228), so any cut-off would be tuned to our corpus. **Default 0.12.** Known imperfect merge at 0.12: the DE addendum's annual entitlement with v1/v2's "encouraged minimum ten days" (both `annual leave | days per year`); each fact keeps its attribute label for the composer.
 
 DESIGN.md wording (after measuring): "The rule-key clustering threshold (cosine distance X, average linkage) was set inside the observed gap between hand-labelled same-rule and different-rule key pairs, leaning strict because over-merging is worse than under-merging; it is stable under ±0.03 perturbation and configurable via `RULE_CLUSTER_THRESHOLD`." — X is the measured value; if there is no clean gap, say so and rely on the LLM check for near-threshold pairs.
 
@@ -1648,7 +1652,7 @@ The LLM contributes **intent**; code decides the route; `validator.py` asserts t
 - **RRF k:** "k=60 (Cormack et al. 2009), robust without tuning; favours agreement, single-retriever hits protected by passing top 8–10 forward; k sensitivity check in the eval."
 - **Chunking:** "Section-based chunks (~350 tokens, max 500): exact heading locators (§4.2), rules kept with their conditions, several versions fit the 3,000 budget; `p. N` fallback without headings."
 - **OCR:** "Vision LLM (verbatim, tool-less, cached) for tables and headings in scans; numbers cross-checked against Tesseract, which is also the fallback."
-- **Rule extraction:** "Typed facts extracted and quote-verified at ingestion, partitioned by unit and conditions, clustered into rule keys with scipy average linkage; precedence resolved in code across all eligible docs; facts select passages, source text answers."
+- **Rule extraction:** "Typed facts extracted and quote-verified at ingestion, partitioned by unit and conditions, clustered into rule keys with average linkage and same-document cannot-link; precedence resolved in code across all eligible docs; facts select passages, source text answers."
 - **Precedence in code:** "§5.1 is an exact ordered algorithm — code applies it reliably, returns true ties as conflicts, and ranks by manifest metadata so document text can't sway it; the LLM handles only fuzzy recognition and wording."
 - **Pipeline vs agent loop:** "Fixed planner (no corpus) → code → composer: bounded latency, one budget-checked corpus call, writes behind proposals, documents structurally unable to trigger tools; ≤ 3 calls with one bounded re-plan."
 - **Server-side proposals:** "One stored proposal per session; on confirmation the stored args execute inside a `BEGIN IMMEDIATE` transaction that claims the proposal and re-validates — no drift, no double execution, no bypass."

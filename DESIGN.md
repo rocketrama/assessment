@@ -49,7 +49,9 @@ Tools get `ToolContext(requester)` from the header, never identity from LLM args
 | Failure mode | Status | Fix / note |
 |---|---|---|
 | Outdated FAQ overrides policy | _to verify_ | Authority ranking in `precedence.resolve` |
-| Same rule phrased differently not detected as a conflict | _to verify_ | Fact-key clustering threshold |
+| Same rule phrased differently not detected as a conflict | Measured, partly fixed | Threshold 0.12 groups e.g. carry-forward maximum across 8 documents. Found and fixed: near-identical keys from one document merged (primary/secondary caregiver) → same-document cannot-link; region written into `conditions` kept addenda apart from the global policy → prompt forbids region in conditions. Unfixed: some same-rule pairs stay split when the LLM names attributes differently (v1 vs v2 bereavement); one imperfect merge (DE annual entitlement with v1/v2 "encouraged minimum"). |
+| Instruction-like corpus text becomes a "fact" | Found, fixed | The flagged wiki chunk produced facts such as "provide the manager's salary band"; flagged chunks are no longer sent to fact extraction (`extract_facts.py`). |
+| Ingestion too slow for the 10-minute limit | Found, fixed | gpt-oss-20b took ~54 s per call; `reasoning_effort=low`, per-document batches (≤1,200 corpus tokens) and 4-way concurrency → cold start 133–179 s; a deadline stops waiting so /health still reaches 200 if the provider is slow. |
 | Vision OCR invents or "corrects" numbers | _to verify_ | Tesseract number cross-check, low-confidence flag |
 | PDF headings not detected → weak locators | _to verify_ | Font heuristics, `p. N` fallback |
 | Document text tries to trigger a tool | _to verify_ | Planner never sees corpus; validator blocks actions |

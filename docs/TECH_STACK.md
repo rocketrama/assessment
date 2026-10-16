@@ -17,7 +17,7 @@
 | **Vector store** | FAISS `IndexFlatIP` | Local (§10.3). Exact search is enough for 30 documents and supports ID pre-filtering. |
 | **Keyword search** | `rank_bm25` | Lexical half of hybrid retrieval; tiny dependency. |
 | **Fusion** | Reciprocal Rank Fusion (own code) | Few parameters, stable, deterministic. |
-| **Rule-key clustering** | `scipy.cluster.hierarchy` (average linkage, cosine distance, distance threshold) | Unknown number of rules, many 2-fact groups, no chaining → agglomerative; scipy instead of sklearn — same algorithm, lighter dependency, includes the dendrogram for choosing the threshold. |
+| **Rule-key clustering** | Average linkage, cosine distance, distance threshold, same-document cannot-link — ~25 lines of numpy (`ingestion/rule_keys.py`) | Unknown number of rules, many 2-fact groups, no chaining → agglomerative. Planned with scipy; Windows Application Control blocked scipy's DLLs on the dev machine, so the algorithm is implemented and unit-tested in numpy (one dependency fewer). |
 | **Cache storage** | Separate SQLite `cache.db` (outside `./data`) | Disposable derived data; transactional (atomic writes); never committed. A design choice — §2.3 would also allow these tables in `veltrix.db`. |
 | **Database** | SQLite via standard-library `sqlite3` | `veltrix.db` is given; add tables only (§2.3); built-in transactions. |
 | **PDF** | `pdfplumber` (text + tables), `pypdfium2` (render pages for OCR) | Tables are required (§4.1). |
@@ -51,7 +51,7 @@
 |---|---|
 | **LangChain / LlamaIndex** | Allowed (FAQ §13), but they hide exactly what reviewers assess: filtering before retrieval, the token budget and precedence. ~200 lines of our own retrieval code are easier to audit and defend. |
 | **Chroma / Qdrant / pgvector** | Fine at scale, but extra overhead for 30 documents. Named as the 10,000-document upgrade path in DESIGN.md. |
-| **scikit-learn** | Only needed for clustering, which `scipy.cluster.hierarchy` already provides (sklearn depends on scipy anyway). |
+| **scikit-learn / scipy** | Only needed for clustering, which is a few lines of numpy here (scipy was also blocked by Windows Application Control on the dev machine). |
 | **PyTorch / sentence-transformers** | Heavy image and slow build; fastembed does the same on CPU. |
 | **Redis / Postgres** | §10.3 allows only LLM and embedding APIs as external services. SQLite is enough. |
 | **GraphRAG** | The hard problem is versioning and precedence, not entity relationships. Corpus-derived summaries count toward the 3,000-token budget and risk mixing access levels. |

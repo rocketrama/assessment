@@ -2,8 +2,12 @@
 
 Runs at startup; `/health` stays 503 until it returns. One bad document is
 logged and skipped instead of failing the whole startup (must-pass #1). Holiday
-rows are extracted from `calendar` documents. Facts and the search index are
-added in later steps.
+rows are extracted from `calendar` documents; policy facts are extracted with
+the LLM and grouped into rule keys. The search index is added in a later step.
+
+The whole run is bounded by INGESTION_BUDGET_SECONDS: fact extraction stops
+waiting at the deadline, so /health reaches 200 within 10 minutes even when the
+LLM provider is slow.
 """
 
 import hashlib
@@ -16,11 +20,15 @@ from dataclasses import dataclass, field, replace
 from app.config import Settings
 from app.ingestion.cache import cache_db_path, connect_cache, get_parsed, put_parsed, replace_corpus
 from app.ingestion.chunker import Chunk, chunk_document
+from app.ingestion.extract_facts import Fact, FactStats, extract_facts
 from app.ingestion.extract_holidays import Holiday, extract_holidays
 from app.ingestion.injection_scan import looks_like_injection
 from app.ingestion.loaders import load_document
 from app.ingestion.loaders.ocr import PageOcr, tesseract_available
 from app.ingestion.manifest import ManifestEntry, ManifestError, load_manifest
+from app.ingestion.rule_keys import DEFAULT_THRESHOLD, assign_rule_keys
+from app.llm.client import LLMClient
+from app.llm.embeddings import Embedder
 from app.llm.vision import VisionTranscriber
 
 log = logging.getLogger("veltrix.ingestion")
@@ -47,6 +55,9 @@ class IngestionReport:
     suspicious_chunks: list[str] = field(default_factory=list)
     low_confidence_chunks: list[str] = field(default_factory=list)
     holidays: Counter = field(default_factory=Counter)  # doc_id → office-closed days
+    facts: FactStats | None = None  # None when no LLM is configured
+    rule_keys: int = 0
+    multi_doc_rules: int = 0  # rule keys stated by more than one document
     seconds: float = 0.0
 
 
@@ -69,8 +80,18 @@ def _sha256(path: str) -> str:
     return h.hexdigest()
 
 
-def run_ingestion(settings: Settings, ocr: PageOcr | None = None) -> IngestionReport:
+# Time kept back for clustering and the final write after the fact deadline.
+_FINISH_MARGIN_SECONDS = 30.0
+
+
+def run_ingestion(
+    settings: Settings,
+    ocr: PageOcr | None = None,
+    llm: LLMClient | None = None,
+    embedder: Embedder | None = None,
+) -> IngestionReport:
     started = time.perf_counter()
+    deadline = time.monotonic() + settings.ingestion_budget_seconds - _FINISH_MARGIN_SECONDS
     try:
         entries, skipped = load_manifest(settings.manifest_path, settings.corpus_dir)
     except ManifestError as exc:
@@ -113,7 +134,21 @@ def run_ingestion(settings: Settings, ocr: PageOcr | None = None) -> IngestionRe
                     report.warnings.append(f"{entry.doc_id}: calendar has no holiday table")
                 all_holidays.extend(holidays)
 
-        replace_corpus(cache, documents, all_chunks, all_holidays)
+        facts: list[Fact] = []
+        llm = llm or LLMClient.from_settings(settings)
+        if llm is not None:
+            calendars = {e.doc_id for e, _ in documents if e.doc_type == "calendar"}
+            fact_chunks = [c for c in all_chunks if c.doc_id not in calendars]
+            facts, report.facts = extract_facts(
+                fact_chunks, llm, cache, concurrency=settings.llm_max_concurrency, deadline=deadline
+            )
+            embedder = embedder or Embedder()
+            threshold = settings.rule_cluster_threshold or DEFAULT_THRESHOLD
+            facts = assign_rule_keys(facts, embedder.embed, threshold)
+        else:
+            report.warnings.append("no LLM configured: policy facts not extracted")
+
+        replace_corpus(cache, documents, all_chunks, all_holidays, facts)
 
     report.documents = len(documents)
     report.chunks = len(all_chunks)
@@ -123,6 +158,11 @@ def run_ingestion(settings: Settings, ocr: PageOcr | None = None) -> IngestionRe
     report.suspicious_chunks = [c.chunk_id for c in all_chunks if c.suspicious]
     report.low_confidence_chunks = [c.chunk_id for c in all_chunks if c.low_confidence]
     report.holidays = Counter(h.doc_id for h in all_holidays if h.office_closed)
+    docs_per_rule: dict[str, set[str]] = {}
+    for f in facts:
+        docs_per_rule.setdefault(f.rule_key, set()).add(f.doc_id)
+    report.rule_keys = len(docs_per_rule)
+    report.multi_doc_rules = sum(1 for docs in docs_per_rule.values() if len(docs) > 1)
     report.seconds = round(time.perf_counter() - started, 2)
     _log_report(report)
     return report
@@ -150,6 +190,15 @@ def _log_report(report: IngestionReport) -> None:
             "suspicious_chunks": report.suspicious_chunks,
             "low_confidence_chunks": report.low_confidence_chunks,
             "holidays": dict(report.holidays),
+            "facts": report.facts.kept if report.facts else None,
+            "facts_dropped": dict(report.facts.dropped) if report.facts else None,
+            "fact_llm_calls": report.facts.llm_calls if report.facts else 0,
+            "fact_cache_hits": report.facts.cache_hits if report.facts else 0,
+            "fact_failed_chunks": len(report.facts.failed_chunks) if report.facts else 0,
+            "fact_deadline_skipped": len(report.facts.deadline_skipped) if report.facts else 0,
+            "fact_seconds": report.facts.seconds if report.facts else 0,
+            "rule_keys": report.rule_keys,
+            "multi_doc_rules": report.multi_doc_rules,
             "seconds": report.seconds,
         },
     )

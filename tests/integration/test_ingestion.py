@@ -156,3 +156,57 @@ def test_real_corpus_structure(tmp_path):
     for c in chunks:
         assert c["locator"].startswith("p. ") or c["locator"] in c["text"].split("\n\n", 1)[0]
     shutil.rmtree(tmp_path / "cache")
+
+
+# --- policy facts (fake LLM and embeddings) ----------------------------------
+
+class _FactProvider:
+    """Returns one grounded fact per excerpt that contains '7 days', and records
+    which excerpts it was sent."""
+
+    def __init__(self):
+        self.seen: list[str] = []
+
+    def chat(self, model, system, user, max_tokens, timeout):
+        import re
+
+        facts = []
+        for chunk_id, body in re.findall(r'<document id="([^"]+)">\n(.*?)\n</document>', user, re.DOTALL):
+            self.seen.append(chunk_id)
+            if "7 days" in body:
+                facts.append(
+                    {"chunk_id": chunk_id, "topic": "staff leave", "attribute": "days", "value": "7",
+                     "unit": "days", "conditions": None, "quote": "Staff get 7 days"}
+                )
+        return json.dumps({"facts": facts})
+
+
+class _FakeEmbedder:
+    def embed(self, texts):
+        import numpy as np
+
+        return np.ones((len(texts), 4), dtype=np.float32) / 2.0
+
+
+def test_facts_are_extracted_keyed_and_stored(corpus):
+    from app.llm.client import LLMClient
+
+    settings, manifest, corpus_dir, entries = corpus
+    (corpus_dir / "cal.md").write_text(
+        "# Cal\n\n| Date | Holiday |\n| --- | --- |\n| 2026-11-04 | Staff get 7 days |\n", encoding="utf-8"
+    )
+    manifest.write_text(json.dumps(entries + [_entry("CAL", "cal.md", doc_type="calendar")]), encoding="utf-8")
+    provider = _FactProvider()
+    report = run_ingestion(settings, NO_OCR, llm=LLMClient(provider, "fake"), embedder=_FakeEmbedder())
+
+    assert not any(cid.startswith(("C::", "CAL::")) for cid in provider.seen)  # flagged + calendar never sent
+    facts = _rows(settings, "SELECT fact_id, doc_id, value, rule_key FROM facts")
+    assert facts == [{"fact_id": "A::000#f00", "doc_id": "A", "value": "7", "rule_key": "staff-leave-days|day"}]
+    assert report.facts.kept == 1 and report.facts.skipped_suspicious == 1
+
+
+def test_without_llm_ingestion_still_succeeds(corpus):
+    settings, *_ = corpus
+    report = run_ingestion(settings, NO_OCR)
+    assert report.facts is None and "no LLM configured: policy facts not extracted" in report.warnings
+    assert _rows(settings, "SELECT COUNT(*) AS n FROM facts") == [{"n": 0}]

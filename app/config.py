@@ -26,6 +26,10 @@ class Settings(BaseSettings):
     nvidia_api_key: str = ""
     llm_max_concurrency: int = 4
     llm_timeout_seconds: float = 12.0
+    # Sent as reasoning_effort to OpenAI-compatible reasoning models (e.g. gpt-oss); empty = not sent
+    llm_reasoning_effort: str = ""
+    # Ingestion must leave /health time to reach 200 within 10 minutes (must-pass #1)
+    ingestion_budget_seconds: float = 480.0
 
     # OCR
     vision_model: str = ""
