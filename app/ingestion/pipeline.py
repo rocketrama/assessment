@@ -1,8 +1,9 @@
 """Ingestion entry point: manifest → load (with OCR) → chunk → injection scan → cache.db.
 
 Runs at startup; `/health` stays 503 until it returns. One bad document is
-logged and skipped instead of failing the whole startup (must-pass #1). Facts,
-holidays and the search index are added in later steps.
+logged and skipped instead of failing the whole startup (must-pass #1). Holiday
+rows are extracted from `calendar` documents. Facts and the search index are
+added in later steps.
 """
 
 import hashlib
@@ -15,6 +16,7 @@ from dataclasses import dataclass, field, replace
 from app.config import Settings
 from app.ingestion.cache import cache_db_path, connect_cache, get_parsed, put_parsed, replace_corpus
 from app.ingestion.chunker import Chunk, chunk_document
+from app.ingestion.extract_holidays import Holiday, extract_holidays
 from app.ingestion.injection_scan import looks_like_injection
 from app.ingestion.loaders import load_document
 from app.ingestion.loaders.ocr import PageOcr
@@ -44,6 +46,7 @@ class IngestionReport:
     ocr_pages: Counter = field(default_factory=Counter)  # engine → chunks
     suspicious_chunks: list[str] = field(default_factory=list)
     low_confidence_chunks: list[str] = field(default_factory=list)
+    holidays: Counter = field(default_factory=Counter)  # doc_id → office-closed days
     seconds: float = 0.0
 
 
@@ -70,6 +73,7 @@ def run_ingestion(settings: Settings, ocr: PageOcr | None = None) -> IngestionRe
     ocr = ocr or build_page_ocr(settings)
     documents: list[tuple[ManifestEntry, str]] = []
     all_chunks: list[Chunk] = []
+    all_holidays: list[Holiday] = []
 
     with connect_cache(cache_db_path(settings.cache_dir)) as cache:
         for entry in entries:
@@ -95,8 +99,14 @@ def run_ingestion(settings: Settings, ocr: PageOcr | None = None) -> IngestionRe
                 report.warnings.append(f"{entry.doc_id}: no text extracted")
             documents.append((entry, sha))
             all_chunks.extend(chunks)
+            if entry.doc_type == "calendar":
+                holidays, warnings = extract_holidays(entry.doc_id, entry.regions, parsed.blocks)
+                report.warnings.extend(f"{entry.doc_id}: {w}" for w in warnings)
+                if not any(h.office_closed for h in holidays):
+                    report.warnings.append(f"{entry.doc_id}: calendar has no holiday table")
+                all_holidays.extend(holidays)
 
-        replace_corpus(cache, documents, all_chunks)
+        replace_corpus(cache, documents, all_chunks, all_holidays)
 
     report.documents = len(documents)
     report.chunks = len(all_chunks)
@@ -105,6 +115,7 @@ def run_ingestion(settings: Settings, ocr: PageOcr | None = None) -> IngestionRe
     report.ocr_pages = Counter(c.ocr_engine for c in all_chunks if c.ocr_engine)
     report.suspicious_chunks = [c.chunk_id for c in all_chunks if c.suspicious]
     report.low_confidence_chunks = [c.chunk_id for c in all_chunks if c.low_confidence]
+    report.holidays = Counter(h.doc_id for h in all_holidays if h.office_closed)
     report.seconds = round(time.perf_counter() - started, 2)
     _log_report(report)
     return report
@@ -131,6 +142,7 @@ def _log_report(report: IngestionReport) -> None:
             "ocr_chunks": dict(report.ocr_pages),
             "suspicious_chunks": report.suspicious_chunks,
             "low_confidence_chunks": report.low_confidence_chunks,
+            "holidays": dict(report.holidays),
             "seconds": report.seconds,
         },
     )

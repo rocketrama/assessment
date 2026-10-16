@@ -4,7 +4,7 @@
   parser version and OCR engines — never by file name, so a modified corpus
   file with the same name is always re-read (must-pass #5). Each entry carries a
   checksum; an entry that fails it is recomputed, never loaded.
-- `documents` / `chunks`: the current corpus, rebuilt in one transaction on every
+- `documents` / `chunks` / `holidays`: the current corpus, rebuilt in one transaction on every
   startup with manifest metadata read fresh, so a stale cache can never mask an
   access-level change.
 
@@ -22,11 +22,12 @@ from datetime import datetime, timezone
 
 from app.ingestion.blocks import Block, ParsedDocument
 from app.ingestion.chunker import Chunk
+from app.ingestion.extract_holidays import Holiday
 from app.ingestion.manifest import ManifestEntry
 
 log = logging.getLogger("veltrix.ingestion")
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -62,9 +63,17 @@ CREATE TABLE IF NOT EXISTS chunks (
     suspicious        INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON chunks(doc_id, ordinal);
+CREATE TABLE IF NOT EXISTS holidays (
+    doc_id        TEXT NOT NULL REFERENCES documents(doc_id),
+    region        TEXT NOT NULL,
+    date          TEXT NOT NULL,
+    name          TEXT NOT NULL,
+    office_closed INTEGER NOT NULL,
+    PRIMARY KEY (doc_id, region, date, name)
+);
 """
 
-_TABLES = ("meta", "parse_cache", "documents", "chunks")
+_TABLES = ("meta", "parse_cache", "documents", "chunks", "holidays")
 
 
 def cache_db_path(cache_dir: str) -> str:
@@ -133,10 +142,12 @@ def replace_corpus(
     conn: sqlite3.Connection,
     documents: list[tuple[ManifestEntry, str]],
     chunks: list[Chunk],
+    holidays: list[Holiday],
 ) -> None:
-    """Swap in the current documents and chunks atomically."""
+    """Swap in the current documents, chunks and holidays atomically."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DELETE FROM holidays")
         conn.execute("DELETE FROM chunks")
         conn.execute("DELETE FROM documents")
         conn.executemany(
@@ -174,6 +185,10 @@ def replace_corpus(
                 )
                 for c in chunks
             ],
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO holidays VALUES (?, ?, ?, ?, ?)",
+            [(h.doc_id, h.region, h.date.isoformat(), h.name, int(h.office_closed)) for h in holidays],
         )
         conn.execute("COMMIT")
     except BaseException:

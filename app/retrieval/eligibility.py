@@ -1,0 +1,39 @@
+"""Section 5.1 eligibility (TASK.pdf §3.1, §5.1). Pure functions over document metadata.
+
+A document can be used only if the requester's role can read its access_level,
+its regions include the requester's region or GLOBAL, and its effective_date is
+on or before the reference date.
+"""
+
+from dataclasses import dataclass
+from datetime import date
+
+GLOBAL = "GLOBAL"
+
+# §3.1: which access levels each role can read.
+READABLE_ACCESS = {
+    "employee": frozenset({"all"}),
+    "manager": frozenset({"all", "managers"}),
+    "hr": frozenset({"all", "managers", "hr"}),
+}
+
+
+@dataclass(frozen=True)
+class DocMeta:
+    doc_id: str
+    doc_type: str
+    regions: tuple[str, ...]
+    effective_date: date
+    access_level: str
+
+
+def can_read(role: str, access_level: str) -> bool:
+    return access_level in READABLE_ACCESS.get(role, frozenset())
+
+
+def covers_region(doc: DocMeta, region: str) -> bool:
+    return GLOBAL in doc.regions or region in doc.regions
+
+
+def is_eligible(doc: DocMeta, role: str, region: str, reference_date: date) -> bool:
+    return can_read(role, doc.access_level) and covers_region(doc, region) and doc.effective_date <= reference_date
