@@ -15,10 +15,11 @@ from fastapi.responses import JSONResponse
 from app.api.schemas import ChatRequest, ChatResponse
 from app.config import Settings, get_settings
 from app.data.db import connect, init_app_tables
-from app.data.employees import Employee, get_employee
+from app.data.employees import Employee, get_employee, known_names
 from app.data.sessions import SessionOwnershipError, claim_session
 from app.ingestion.pipeline import run_ingestion
 from app.logging_setup import configure_logging
+from app.privacy.log_filter import PII_FILTER
 
 log = logging.getLogger("veltrix")
 
@@ -42,6 +43,8 @@ def create_app(
             # Never let sqlite3 create an empty DB in place of the reviewers' file.
             raise FileNotFoundError(f"database not found: {settings.db_path}")
         init_app_tables(settings.db_path)
+        with connect(settings.db_path) as conn:
+            PII_FILTER.set_names(known_names(conn))
         ingest(settings)
 
     async def _run_startup() -> None:
