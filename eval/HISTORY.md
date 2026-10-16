@@ -4,18 +4,18 @@ Same 48 cases × 3 runs (`eval/cases.yaml`), real service, model `nvidia:openai/
 (`LLM_REASONING_EFFORT=low`), dev DB, APP_TODAY 2026-09-15. The latest full report is
 `eval/report.md`; this file keeps the scorecard of every round and what changed between them.
 
-| Metric | Baseline | Round 1 | Round 2 |
-|---|---|---|---|
-| Cases fully correct (case × run) | 110/150 (73%) | 131/150 (87%) | 137/150 (91%) |
-| Route accuracy | 79% | 91% | 96% |
-| Required citations present (recall) | 79% | 100% | 100% |
-| Citation precision | 92% | 97% | 99% |
-| Outdated / restricted documents not cited | 92% | 97% | 100% |
-| Key facts in the answer | 71% | 89% | 91% |
-| Wrong or forbidden content avoided | 100% | 100% | 94% |
-| Tool calls as expected | 53% | 70% | 87% |
-| Consistent across 3 runs | 74% | 75% | 72% |
-| Latency median / p95 / max (limit 30 s) | 3.2 / 6.1 / 10.1 s | 3.7 / 8.1 / 12.2 s | 3.6 / 7.4 / 17.8 s |
+| Metric | Baseline | Round 1 | Round 2 | Round 3 |
+|---|---|---|---|---|
+| Cases fully correct (case × run) | 110/150 (73%) | 131/150 (87%) | 137/150 (91%) | 142/150 (95%) |
+| Route accuracy | 79% | 91% | 96% | 99% |
+| Required citations present (recall) | 79% | 100% | 100% | 98% |
+| Citation precision | 92% | 97% | 99% | 98% |
+| Outdated / restricted documents not cited | 92% | 97% | 100% | 97% |
+| Key facts in the answer | 71% | 89% | 91% | 94% |
+| Wrong or forbidden content avoided | 100% | 100% | 94% | 100% |
+| Tool calls as expected | 53% | 70% | 87% | 97% |
+| Consistent across 3 runs | 74% | 75% | 72% | 79% |
+| Latency median / p95 / max (limit 30 s) | 3.2 / 6.1 / 10.1 s | 3.7 / 8.1 / 12.2 s | 3.6 / 7.4 / 17.8 s | 3.9 / 9.3 / 21.0 s |
 
 ## Baseline → round 1
 
@@ -56,3 +56,18 @@ Same 48 cases × 3 runs (`eval/cases.yaml`), real service, model `nvidia:openai/
   "4 weeks" with "two blocks" and "within six months").
 - Remaining run-to-run variation is mostly provider timeouts on the free NVIDIA endpoint
   (requests that end in the safe "please try again") and planner variance.
+
+## Round 3: what is still wrong (not fixed)
+
+- **Future balance** ("how many days will I have by December?"): 0/3. The model doesn't do the
+  accrual arithmetic reliably (answers 12, 33 and 10 days; or claims there is no accrual rate).
+  Prompt guidance didn't fix it. The real fix is the one in DESIGN §3: compute the arithmetic in
+  code from the tool balance and the accrual facts, and let the model only explain it.
+- **Half days**: the invented "yes, half days are allowed" still appears in 1 of 3 runs (was 3/3).
+  The FAQ with the right answer is retrieved; the model sometimes ignores it. The passage that
+  says it in the policy (v2 §11 "whole days") isn't in the top 10 hits for that wording.
+- **Team leave**: sometimes lists only the approved request and omits the pending one.
+- **WFH for India**: 1 of 3 runs answered 2 days instead of the memo's 3.
+- One request ended in the safe "please try again" (provider timeout); slowest reply 21.0 s.
+- These are answer-writing failures of a small model at low reasoning effort; the deterministic
+  parts (access, precedence table, routes, tools, dates) were correct in every run.
