@@ -30,6 +30,8 @@ class Settings(BaseSettings):
     # OCR
     vision_model: str = ""
     ocr_min_confidence: float = 70.0
+    # Full path to tesseract when it is not on PATH (e.g. Windows); empty = PATH
+    tesseract_cmd: str = ""
 
     # Retrieval / rule extraction
     embedding_provider: str = "local"

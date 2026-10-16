@@ -18,9 +18,10 @@ class FakeVision:
     def __init__(self, text=VISION_TEXT, fail=False):
         self.text, self.fail, self.calls = text, fail, 0
 
-    def transcribe(self, image_png: bytes) -> str:
+    def transcribe(self, image_jpeg: bytes) -> str:
         self.calls += 1
-        assert image_png.startswith(b"\x89PNG")
+        assert image_jpeg.startswith(b"\xff\xd8")  # JPEG
+        assert len(image_jpeg) < 400_000
         if self.fail:
             raise TimeoutError("provider timeout")
         return self.text

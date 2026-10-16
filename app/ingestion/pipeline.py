@@ -19,7 +19,7 @@ from app.ingestion.chunker import Chunk, chunk_document
 from app.ingestion.extract_holidays import Holiday, extract_holidays
 from app.ingestion.injection_scan import looks_like_injection
 from app.ingestion.loaders import load_document
-from app.ingestion.loaders.ocr import PageOcr
+from app.ingestion.loaders.ocr import PageOcr, tesseract_available
 from app.ingestion.manifest import ManifestEntry, ManifestError, load_manifest
 from app.llm.vision import VisionTranscriber
 
@@ -51,7 +51,14 @@ class IngestionReport:
 
 
 def build_page_ocr(settings: Settings) -> PageOcr:
-    return PageOcr(vision=VisionTranscriber.from_settings(settings), min_confidence=settings.ocr_min_confidence)
+    use_tesseract = tesseract_available(settings.tesseract_cmd)
+    if not use_tesseract:
+        log.warning("tesseract not available; scanned pages depend on the vision model")
+    return PageOcr(
+        vision=VisionTranscriber.from_settings(settings),
+        use_tesseract=use_tesseract,
+        min_confidence=settings.ocr_min_confidence,
+    )
 
 
 def _sha256(path: str) -> str:

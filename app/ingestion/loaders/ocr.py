@@ -28,19 +28,22 @@ _NUMBER_RE = re.compile(r"\d+")
 
 
 class Transcriber(Protocol):
-    """Image → verbatim markdown. Implemented by app/llm/vision.py."""
+    """Image (JPEG bytes) → verbatim markdown. Implemented by app/llm/vision.py."""
 
     model: str
 
-    def transcribe(self, image_png: bytes) -> str: ...
+    def transcribe(self, image_jpeg: bytes) -> str: ...
 
 
-def tesseract_available() -> bool:
-    if shutil.which("tesseract") is None:
+def tesseract_available(cmd: str = "") -> bool:
+    """True when Tesseract runs. `cmd` is an explicit binary path (TESSERACT_CMD)."""
+    import pytesseract
+
+    if cmd:
+        pytesseract.pytesseract.tesseract_cmd = cmd
+    elif shutil.which("tesseract") is None:
         return False
     try:
-        import pytesseract
-
         pytesseract.get_tesseract_version()
         return True
     except Exception:
@@ -72,7 +75,7 @@ class PageOcr:
 
         if self.vision is not None:
             try:
-                text = _strip_fences(self.vision.transcribe(_png_bytes(image)))
+                text = _strip_fences(self.vision.transcribe(_jpeg_bytes(image)))
                 low = False
                 if tess_text is not None:
                     missing = set(_NUMBER_RE.findall(text)) - set(_NUMBER_RE.findall(tess_text))
@@ -103,13 +106,14 @@ def _render(path: str, page_no: int):
         pdf.close()
 
 
-def _png_bytes(image, max_side: int = 2000) -> bytes:
-    # Downscale for the API payload; 2000 px still keeps body text sharp.
+def _jpeg_bytes(image, max_side: int = 1600) -> bytes:
+    # Small API payload (~100–200 KB instead of >1 MB as PNG); 1600 px grayscale
+    # keeps body text sharp. Tesseract still reads the full 300 DPI render.
     scale = max_side / max(image.size)
     if scale < 1:
         image = image.resize((round(image.width * scale), round(image.height * scale)))
     buf = io.BytesIO()
-    image.save(buf, format="PNG", optimize=True)
+    image.convert("L").save(buf, format="JPEG", quality=85)
     return buf.getvalue()
 
 

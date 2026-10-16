@@ -16,7 +16,9 @@ from app.config import Settings
 
 log = logging.getLogger("veltrix.llm")
 
-OCR_TIMEOUT_SECONDS = 90.0
+# One attempt, bounded: a failed vision call falls back to Tesseract and is not
+# cached, so it is retried every startup — its cost must stay small (must-pass #1).
+OCR_TIMEOUT_SECONDS = 45.0
 
 TRANSCRIBE_PROMPT = (
     "Transcribe the text of this scanned document page exactly as written.\n"
@@ -32,7 +34,7 @@ TRANSCRIBE_PROMPT = (
 class VisionTranscriber:
     def __init__(self, model: str, api_key: str, base_url: str | None = None) -> None:
         self.model = model
-        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=OCR_TIMEOUT_SECONDS, max_retries=1)
+        self._client = OpenAI(api_key=api_key, base_url=base_url, timeout=OCR_TIMEOUT_SECONDS, max_retries=0)
 
     @classmethod
     def from_settings(cls, settings: Settings) -> "VisionTranscriber | None":
@@ -48,8 +50,8 @@ class VisionTranscriber:
             return None
         return cls(settings.vision_model, key, settings.llm_base_url or None)
 
-    def transcribe(self, image_png: bytes) -> str:
-        data_url = "data:image/png;base64," + base64.b64encode(image_png).decode("ascii")
+    def transcribe(self, image_jpeg: bytes) -> str:
+        data_url = "data:image/jpeg;base64," + base64.b64encode(image_jpeg).decode("ascii")
         started = time.perf_counter()
         response = self._client.chat.completions.create(
             model=self.model,
