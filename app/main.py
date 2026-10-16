@@ -17,9 +17,12 @@ from app.config import Settings, get_settings
 from app.data.db import connect, init_app_tables
 from app.data.employees import Employee, get_employee, known_names
 from app.data.sessions import SessionOwnershipError, claim_session
+from app.ingestion.cache import cache_db_path
 from app.ingestion.pipeline import run_ingestion
+from app.llm.embeddings import Embedder
 from app.logging_setup import configure_logging
 from app.privacy.log_filter import PII_FILTER
+from app.retrieval.retriever import Retriever
 
 log = logging.getLogger("veltrix")
 
@@ -28,6 +31,7 @@ class AppState:
     def __init__(self) -> None:
         self.ready = False
         self.error: str | None = None
+        self.retriever: Retriever | None = None
 
 
 def create_app(
@@ -46,6 +50,12 @@ def create_app(
         with connect(settings.db_path) as conn:
             PII_FILTER.set_names(known_names(conn))
         ingest(settings)
+        cache_db = cache_db_path(settings.cache_dir)
+        if os.path.isfile(cache_db):
+            state.retriever = Retriever.load(cache_db, Embedder())
+            log.info("retriever ready", extra={"chunks": len(state.retriever.index)})
+        else:
+            log.warning("no ingestion cache; retrieval unavailable")
 
     async def _run_startup() -> None:
         try:

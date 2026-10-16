@@ -3,7 +3,7 @@
 import numpy as np
 
 from app.ingestion.extract_facts import Fact
-from app.ingestion.rule_keys import assign_rule_keys, normalize_conditions, normalize_unit
+from app.ingestion.rule_keys import assign_rule_keys, normalize_conditions
 
 # Hand-made embedding space: near-synonyms get near-identical vectors.
 _VECTORS = {
@@ -36,7 +36,7 @@ def test_same_rule_with_different_values_and_wording_shares_a_key():
         ]
     )
     assert len(set(k.values())) == 1
-    assert k["V1::005#f00"] == "sick-leave-days-per-year|day"
+    assert k["V1::005#f00"] == "sick-leave-days-per-year"
 
 
 def test_different_conditions_never_merge():
@@ -69,11 +69,19 @@ def test_deterministic_regardless_of_input_order():
     assert keys(facts) == keys(list(reversed(facts)))
 
 
-def test_unit_and_condition_normalisation():
-    assert normalize_unit("Working Days") == normalize_unit("days") == normalize_unit("business day") == "day"
-    assert normalize_unit("days per month") == "day per month"
-    assert normalize_unit("calendar days") == "calendar day"
-    assert normalize_unit(None) == normalize_unit("N/A") == ""
+def test_units_do_not_split_a_rule():
+    """The LLM names units inconsistently; the same rule must still meet."""
+    k = keys(
+        [
+            F("V2::007#f00", "sick leave", "days per year", "12", unit="working days", doc="V2"),
+            F("FAQ::001#f00", "sick leave", "days per year", "10", unit="paid sick days", doc="FAQ"),
+        ]
+    )
+    assert k["V2::007#f00"] == k["FAQ::001#f00"]
+
+
+def test_condition_normalisation():
+    assert normalize_conditions("N/A") == ""
     assert normalize_conditions("Levels L1–L3") == normalize_conditions("levels l1-l3")
     assert normalize_conditions("All employees") == normalize_conditions(None) == ""
 

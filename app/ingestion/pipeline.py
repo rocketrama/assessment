@@ -3,7 +3,8 @@
 Runs at startup; `/health` stays 503 until it returns. One bad document is
 logged and skipped instead of failing the whole startup (must-pass #1). Holiday
 rows are extracted from `calendar` documents; policy facts are extracted with
-the LLM and grouped into rule keys. The search index is added in a later step.
+the LLM and grouped into rule keys; every chunk is embedded locally for search
+(vectors cached by chunk text).
 
 The whole run is bounded by INGESTION_BUDGET_SECONDS: fact extraction stops
 waiting at the deadline, so /health reaches 200 within 10 minutes even when the
@@ -17,8 +18,19 @@ import time
 from collections import Counter
 from dataclasses import dataclass, field, replace
 
+import numpy as np
+
 from app.config import Settings
-from app.ingestion.cache import cache_db_path, connect_cache, get_parsed, put_parsed, replace_corpus
+from app.ingestion.cache import (
+    cache_db_path,
+    connect_cache,
+    embedding_key,
+    get_embeddings,
+    get_parsed,
+    put_embeddings,
+    put_parsed,
+    replace_corpus,
+)
 from app.ingestion.chunker import Chunk, chunk_document
 from app.ingestion.extract_facts import Fact, FactStats, extract_facts
 from app.ingestion.extract_holidays import Holiday, extract_holidays
@@ -134,6 +146,9 @@ def run_ingestion(
                     report.warnings.append(f"{entry.doc_id}: calendar has no holiday table")
                 all_holidays.extend(holidays)
 
+        embedder = embedder or Embedder()
+        vectors = _embed_chunks(cache, all_chunks, embedder)
+
         facts: list[Fact] = []
         llm = llm or LLMClient.from_settings(settings)
         if llm is not None:
@@ -142,13 +157,12 @@ def run_ingestion(
             facts, report.facts = extract_facts(
                 fact_chunks, llm, cache, concurrency=settings.llm_max_concurrency, deadline=deadline
             )
-            embedder = embedder or Embedder()
             threshold = settings.rule_cluster_threshold or DEFAULT_THRESHOLD
             facts = assign_rule_keys(facts, embedder.embed, threshold)
         else:
             report.warnings.append("no LLM configured: policy facts not extracted")
 
-        replace_corpus(cache, documents, all_chunks, all_holidays, facts)
+        replace_corpus(cache, documents, all_chunks, all_holidays, facts, vectors)
 
     report.documents = len(documents)
     report.chunks = len(all_chunks)
@@ -166,6 +180,20 @@ def run_ingestion(
     report.seconds = round(time.perf_counter() - started, 2)
     _log_report(report)
     return report
+
+
+def _embed_chunks(cache, chunks: list[Chunk], embedder: Embedder) -> dict[str, bytes]:
+    """chunk_id → float32 vector bytes; only chunks with new text are embedded."""
+    model = getattr(embedder, "model_name", "embedder")
+    keys = {c.chunk_id: embedding_key(model, c.text) for c in chunks}
+    cached = get_embeddings(cache, list(keys.values()))
+    missing = [c for c in chunks if keys[c.chunk_id] not in cached]
+    if missing:
+        fresh = embedder.embed([c.text for c in missing])
+        new = {keys[c.chunk_id]: np.asarray(v, dtype=np.float32).tobytes() for c, v in zip(missing, fresh)}
+        put_embeddings(cache, new)
+        cached.update(new)
+    return {c.chunk_id: cached[keys[c.chunk_id]] for c in chunks}
 
 
 def _flag(chunk: Chunk) -> Chunk:

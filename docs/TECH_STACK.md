@@ -14,8 +14,8 @@
 | **LLM** | Anthropic SDK (default) behind our own `LLMProvider` interface, plus an OpenAI adapter | §10.3: at least one provider; reviewers use their own key. Swappable provider. |
 | **Token counting** | `tiktoken` (`cl100k_base`) | Required by §4.3 (3,000 corpus-token cap). Encoding pre-cached at Docker build time (`TIKTOKEN_CACHE_DIR`) — tiktoken otherwise downloads it on first use. |
 | **Embeddings** | `fastembed` — `BAAI/bge-small-en-v1.5` (CPU, ONNX) | §10.3: local embeddings must run on CPU. No PyTorch → small image, fast startup. |
-| **Vector store** | FAISS `IndexFlatIP` | Local (§10.3). Exact search is enough for 30 documents and supports ID pre-filtering. |
-| **Keyword search** | `rank_bm25` | Lexical half of hybrid retrieval; tiny dependency. |
+| **Vector store** | numpy exact cosine search (`retrieval/index.py`) | Local (§10.3). For ~150 chunks this is one matrix product with the same results as FAISS `IndexFlatIP`; no compiled dependency to break (Windows Application Control blocked scipy on the dev machine; FAISS ships the same kind of DLLs). |
+| **Keyword search** | BM25 with Lucene IDF, ~20 lines | Lexical half of hybrid retrieval. `rank_bm25`'s Okapi IDF is 0 for a term in half the documents — common in small allowed sets. |
 | **Fusion** | Reciprocal Rank Fusion (own code) | Few parameters, stable, deterministic. |
 | **Rule-key clustering** | Average linkage, cosine distance, distance threshold, same-document cannot-link — ~25 lines of numpy (`ingestion/rule_keys.py`) | Unknown number of rules, many 2-fact groups, no chaining → agglomerative. Planned with scipy; Windows Application Control blocked scipy's DLLs on the dev machine, so the algorithm is implemented and unit-tested in numpy (one dependency fewer). |
 | **Cache storage** | Separate SQLite `cache.db` (outside `./data`) | Disposable derived data; transactional (atomic writes); never committed. A design choice — §2.3 would also allow these tables in `veltrix.db`. |
@@ -63,7 +63,7 @@
 
 | Today | At scale |
 |---|---|
-| FAISS flat + ID allow-list | Qdrant / pgvector with payload indexes on `access_level`, `region`, `effective_date` |
+| numpy exact search + ID allow-list | Qdrant / pgvector with payload indexes on `access_level`, `region`, `effective_date` |
 | Ingestion at startup | Offline incremental ingestion with content-hash cache |
 | Pairwise near-duplicate check | MinHash LSH |
 | Fact-key clustering O(n²) | Approximate-nearest-neighbour clustering, incremental assignment |
@@ -74,4 +74,4 @@
 
 ## 5. One-line summary for DESIGN.md
 
-> Deliberately minimal stack: FastAPI + SQLite + FAISS/BM25 + fastembed, no orchestration framework — so access filtering, the token budget and precedence are explicit, auditable code rather than framework defaults.
+> Deliberately minimal stack: FastAPI + SQLite + BM25/dense (numpy) + fastembed, no orchestration framework — so access filtering, the token budget and precedence are explicit, auditable code rather than framework defaults.

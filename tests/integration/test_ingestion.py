@@ -201,7 +201,7 @@ def test_facts_are_extracted_keyed_and_stored(corpus):
 
     assert not any(cid.startswith(("C::", "CAL::")) for cid in provider.seen)  # flagged + calendar never sent
     facts = _rows(settings, "SELECT fact_id, doc_id, value, rule_key FROM facts")
-    assert facts == [{"fact_id": "A::000#f00", "doc_id": "A", "value": "7", "rule_key": "staff-leave-days|day"}]
+    assert facts == [{"fact_id": "A::000#f00", "doc_id": "A", "value": "7", "rule_key": "staff-leave-days"}]
     assert report.facts.kept == 1 and report.facts.skipped_suspicious == 1
 
 

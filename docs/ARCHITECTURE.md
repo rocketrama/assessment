@@ -25,7 +25,7 @@ flowchart LR
     subgraph Startup["Startup (once)"]
         M[manifest.json] --> ING
         C[corpus/*] --> ING[Ingestion pipeline]
-        ING --> IDX[(FAISS + BM25 index)]
+        ING --> IDX[(BM25 + dense index, numpy)]
         ING --> KDB[(SQLite: chunks, facts, holidays)]
         ING --> READY{{ready flag}}
     end
@@ -58,8 +58,8 @@ flowchart LR
 | API | **FastAPI + Uvicorn**, Pydantic v2 models | Strict request/response schemas → exact contract, free 400 handling. |
 | LLM | **Anthropic (default)** behind `LLMProvider` interface; OpenAI adapter | Reviewers use their own key; native tool/JSON output; temperature 0. |
 | Embeddings | **fastembed `BAAI/bge-small-en-v1.5`** (ONNX, CPU) | No torch → small image, fast startup, no external dependency at query time. |
-| Vector store | **FAISS `IndexFlatIP`** + `IDSelectorBatch` pre-filter | Corpus is tiny; exact search; pre-filter guarantees restricted chunks are never candidates. |
-| Lexical | **rank_bm25** | Policy questions are keyword-heavy ("sick leave", "carry forward"); hybrid beats dense alone. |
+| Vector store | **numpy exact cosine** over the allowed rows only (`retrieval/index.py`) | Corpus is tiny; exact search, same results as FAISS `IndexFlatIP` without its compiled dependency; only allowed rows are ever scored, so restricted chunks are never candidates. |
+| Lexical | **BM25, own ~20 lines** (Lucene IDF) | Policy questions are keyword-heavy ("sick leave", "carry forward"); hybrid beats dense alone. `rank_bm25`'s Okapi IDF gives 0 to terms in half the documents, which hurts small allowed sets; statistics are computed over the allowed set only. |
 | Fusion | **Reciprocal Rank Fusion** | Parameter-light, stable, deterministic. |
 | Parsing | `pypdf`/`pdfplumber` (PDF + tables), `python-docx`, `markdown-it`, `BeautifulSoup` | Each preserves headings and tables in a common block model. |
 | OCR | **Vision LLM** primary, **Tesseract** fallback | Vision handles tables in scans well; Tesseract keeps ingestion alive if the LLM is unavailable. |
@@ -87,7 +87,7 @@ veltrix-assistant/
 │   │   └── injection_scan.py   # flags instruction-like text
 │   ├── retrieval/
 │   │   ├── eligibility.py      # access/region/date rules (pure functions)
-│   │   ├── index.py            # FAISS + BM25, filtered search
+│   │   ├── index.py            # BM25 + dense (numpy), RRF, search over allowed ids only
 │   │   ├── precedence.py       # authority → scope → recency resolver
 │   │   └── context_packer.py   # token-budgeted context assembly
 │   ├── orchestration/
@@ -192,7 +192,7 @@ Heuristic + pattern scan ("ignore previous", "you are an AI", "call the tool", "
 - Ingestion runs in a background task at startup; `/health` returns **503** until the integrity report passes, then **200**.
 - Cache keyed by `sha256(file bytes) + pipeline version + model IDs + prompt version` — **never by file name** (the modified corpus keeps names but changes content) → re-runs skip unchanged docs (fast restarts, important at scale). Cached per stage (parse/OCR → chunks → facts → embeddings); rule-key clustering is always recomputed.
 - **Manifest metadata is never cached**: `access_level`, `regions`, `effective_date`, `doc_type` are read fresh from `manifest.json` at every startup and attached to chunks then, so an access change can't be masked by stale cache. Documents not in the manifest are dropped.
-- Cache lives outside `./data` in a **separate SQLite cache DB** (transactional, so entries are never half-written); the FAISS index file is written to a temp file and swapped in with `os.replace`. Entries carry a schema version and checksum; invalid entries are recomputed and logged, never loaded. The cold path (empty cache, as graders start) is tested against the 10-minute limit.
+- Cache lives outside `./data` in a **separate SQLite cache DB** (transactional, so entries are never half-written); chunk vectors live in `cache.db` too, so the whole corpus swaps in one transaction. Entries carry a schema version and checksum; invalid entries are recomputed and logged, never loaded. The cold path (empty cache, as graders start) is tested against the 10-minute limit.
 - Target: well under the 10-minute limit (≈30 docs; LLM extraction parallelized with bounded concurrency).
 
 ---
@@ -204,7 +204,7 @@ Two SQLite files with different lifecycles. The split is a **design choice, not 
 | File | Lifecycle | Tables |
 |---|---|---|
 | **`veltrix.db`** (`DB_PATH`, in `./data`) | Source of truth; **replaced by reviewers** | Existing: `employees`, `leave_balances`, `leave_requests` (untouched). Added (§2.3): `sessions`, `messages`, `proposals` |
-| **`cache.db`** (cache dir, **outside `./data`**) | Disposable, rebuildable, **never committed** (`.gitignore`) | `documents`, `chunks`, `policy_facts`, `holidays`, per-stage ingestion caches; FAISS index file alongside |
+| **`cache.db`** (cache dir, **outside `./data`**) | Disposable, rebuildable, **never committed** (`.gitignore`) | `documents`, `chunks`, `policy_facts`, `holidays`, chunk vectors, per-stage ingestion caches |
 
 **Why `proposals` must live in `veltrix.db`:** the proposal is claimed and deleted in the same `BEGIN IMMEDIATE` transaction as the leave insert and balance update (§10). Transactions are atomic only within one file — across `ATTACH`ed databases in WAL mode they are not. Rule: anything written in the same transaction as leave data lives in `veltrix.db`.
 
@@ -270,7 +270,7 @@ upcoming check: re-run the resolution with d' = upcoming_doc.effective_date;
 ```mermaid
 flowchart LR
     Q[Sub-queries from planner] --> F[Eligible chunk IDs\nfrom eligibility.py]
-    F --> S[FAISS + BM25 search\nrestricted to eligible IDs]
+    F --> S[BM25 + dense search\nrestricted to eligible IDs]
     S --> R[RRF fusion → collapse true duplicates\nidentical facts only]
     R --> P[Precedence: winning + conflicting\n+ upcoming chunks first]
     P --> K[Context packer\ntiktoken, hard cap 3,000]
@@ -451,7 +451,7 @@ stateDiagram-v2
 | **Ingestion time** | Per-chunk LLM fact extraction ≈ 10⁵ calls; 10-min startup impossible | Ingestion as an offline/incremental job (content-hash cache), batch extraction, cheaper model for extraction, serve while indexing new docs |
 | **Fact canonicalization** | Clustering all fact keys is O(n²) | ANN-based clustering, hierarchical topic keys, incremental assignment to existing clusters |
 | **Context budget** | More versions/addenda per rule → winners + conflicts + upcoming no longer fit 3,000 tokens | Resolve precedence on facts *before* retrieval and send only winning + conflicting spans (quote-level, not chunk-level) |
-| **Vector search & filtering** | Flat FAISS + ID allow-lists get slow and memory-heavy | Qdrant/pgvector with payload indexes on access_level/region/effective_date |
+| **Vector search & filtering** | Exact numpy search + ID allow-lists get slow and memory-heavy (~50k chunks is still ~10 ms; ~1M is not) | Qdrant/pgvector with payload indexes on access_level/region/effective_date |
 | **Near-duplicates** | Pairwise comparison explodes | MinHash LSH |
 | **Single SQLite writer** | Concurrent leave writes | Postgres with row-level locking |
 

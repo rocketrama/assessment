@@ -60,3 +60,33 @@ def client(settings) -> Iterator[TestClient]:
     with TestClient(create_app(settings)) as c:
         wait_ready(c)
         yield c
+
+
+class HashingEmbedder:
+    """Deterministic stand-in for the local embedding model: hashed bag of words,
+    unit length. Keeps tests fast and offline; shared words → similar vectors."""
+
+    model_name = "test-hashing"
+
+    def embed(self, texts):
+        import re
+        import zlib
+
+        import numpy as np
+
+        out = np.zeros((len(texts), 384), dtype=np.float32)
+        for row, text in enumerate(texts):
+            for word in re.findall(r"[a-z0-9]+", text.lower()):
+                out[row, zlib.crc32(word.encode()) % 384] += 1.0
+        norms = np.linalg.norm(out, axis=1, keepdims=True)
+        return out / np.where(norms == 0, 1, norms)
+
+    def embed_query(self, query):
+        return self.embed([query])[0]
+
+
+@pytest.fixture(autouse=True)
+def _no_model_downloads(monkeypatch):
+    """Tests never load the real embedding model (network, seconds per test)."""
+    monkeypatch.setattr("app.ingestion.pipeline.Embedder", HashingEmbedder)
+    monkeypatch.setattr("app.main.Embedder", HashingEmbedder)

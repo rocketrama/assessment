@@ -4,7 +4,8 @@
   parser version and OCR engines — never by file name, so a modified corpus
   file with the same name is always re-read (must-pass #5). Each entry carries a
   checksum; an entry that fails it is recomputed, never loaded.
-- `documents` / `chunks` / `holidays` / `facts`: the current corpus, rebuilt in one transaction on every
+- `embedding_cache`: chunk vectors keyed by model + chunk text.
+- `documents` / `chunks` / `chunk_vectors` / `holidays` / `facts`: the current corpus, rebuilt in one transaction on every
   startup with manifest metadata read fresh, so a stale cache can never mask an
   access-level change.
 
@@ -28,6 +29,8 @@ from app.ingestion.manifest import ManifestEntry
 
 log = logging.getLogger("veltrix.ingestion")
 
+# Bump only for incompatible changes (it wipes the cache); new tables are
+# created by CREATE IF NOT EXISTS on every connect.
 SCHEMA_VERSION = 3
 
 _SCHEMA = """
@@ -86,9 +89,17 @@ CREATE TABLE IF NOT EXISTS facts (
 );
 CREATE INDEX IF NOT EXISTS idx_facts_rule ON facts(rule_key);
 CREATE INDEX IF NOT EXISTS idx_facts_chunk ON facts(chunk_id);
+CREATE TABLE IF NOT EXISTS embedding_cache (
+    cache_key TEXT PRIMARY KEY,
+    vector    BLOB NOT NULL
+);
+CREATE TABLE IF NOT EXISTS chunk_vectors (
+    chunk_id TEXT PRIMARY KEY REFERENCES chunks(chunk_id),
+    vector   BLOB NOT NULL
+);
 """
 
-_TABLES = ("meta", "parse_cache", "fact_cache", "documents", "chunks", "holidays", "facts")
+_TABLES = ("meta", "parse_cache", "fact_cache", "embedding_cache", "documents", "chunks", "chunk_vectors", "holidays", "facts")
 
 
 def cache_db_path(cache_dir: str) -> str:
@@ -113,6 +124,7 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
     has_meta = conn.execute("SELECT 1 FROM sqlite_master WHERE name = 'meta'").fetchone()
     row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone() if has_meta else None
     if row is not None and row["value"] == str(SCHEMA_VERSION):
+        conn.executescript(_SCHEMA)  # additive tables from newer code
         return
     if row is not None:
         log.warning("cache schema changed; rebuilding cache", extra={"old": row["value"], "new": SCHEMA_VERSION})
@@ -153,16 +165,35 @@ def put_parsed(conn: sqlite3.Connection, cache_key: str, doc_id: str, parsed: Pa
     )
 
 
+def embedding_key(model: str, text: str) -> str:
+    return hashlib.sha256(f"{model}\0{text}".encode("utf-8")).hexdigest()
+
+
+def get_embeddings(conn: sqlite3.Connection, keys: list[str]) -> dict[str, bytes]:
+    found: dict[str, bytes] = {}
+    for i in range(0, len(keys), 500):
+        part = keys[i : i + 500]
+        marks = ",".join("?" * len(part))
+        found.update(conn.execute(f"SELECT cache_key, vector FROM embedding_cache WHERE cache_key IN ({marks})", part).fetchall())
+    return found
+
+
+def put_embeddings(conn: sqlite3.Connection, items: dict[str, bytes]) -> None:
+    conn.executemany("INSERT OR REPLACE INTO embedding_cache VALUES (?, ?)", list(items.items()))
+
+
 def replace_corpus(
     conn: sqlite3.Connection,
     documents: list[tuple[ManifestEntry, str]],
     chunks: list[Chunk],
     holidays: list[Holiday],
     facts: list[Fact] = (),
+    vectors: dict[str, bytes] | None = None,
 ) -> None:
-    """Swap in the current documents, chunks, holidays and facts atomically."""
+    """Swap in the current documents, chunks, vectors, holidays and facts atomically."""
     conn.execute("BEGIN IMMEDIATE")
     try:
+        conn.execute("DELETE FROM chunk_vectors")
         conn.execute("DELETE FROM facts")
         conn.execute("DELETE FROM holidays")
         conn.execute("DELETE FROM chunks")
@@ -214,6 +245,7 @@ def replace_corpus(
                 for f in facts
             ],
         )
+        conn.executemany("INSERT INTO chunk_vectors VALUES (?, ?)", list((vectors or {}).items()))
         conn.execute("COMMIT")
     except BaseException:
         conn.execute("ROLLBACK")

@@ -5,6 +5,7 @@ its regions include the requester's region or GLOBAL, and its effective_date is
 on or before the reference date.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import date
 
@@ -37,3 +38,24 @@ def covers_region(doc: DocMeta, region: str) -> bool:
 
 def is_eligible(doc: DocMeta, role: str, region: str, reference_date: date) -> bool:
     return can_read(role, doc.access_level) and covers_region(doc, region) and doc.effective_date <= reference_date
+
+
+def is_upcoming(doc: DocMeta, role: str, region: str, reference_date: date) -> bool:
+    """Readable and for the region, but not yet effective: a candidate to be
+    mentioned as an upcoming change, never used as the current answer."""
+    return can_read(role, doc.access_level) and covers_region(doc, region) and doc.effective_date > reference_date
+
+
+def allowed_chunk_ids(
+    chunk_docs: Mapping[str, str], docs: Mapping[str, DocMeta], role: str, region: str, reference_date: date
+) -> frozenset[str]:
+    """Chunks of eligible documents: the only chunks retrieval may search (§7.2)."""
+    ok = {d.doc_id for d in docs.values() if is_eligible(d, role, region, reference_date)}
+    return frozenset(c for c, doc_id in chunk_docs.items() if doc_id in ok)
+
+
+def upcoming_chunk_ids(
+    chunk_docs: Mapping[str, str], docs: Mapping[str, DocMeta], role: str, region: str, reference_date: date
+) -> frozenset[str]:
+    ok = {d.doc_id for d in docs.values() if is_upcoming(d, role, region, reference_date)}
+    return frozenset(c for c, doc_id in chunk_docs.items() if doc_id in ok)

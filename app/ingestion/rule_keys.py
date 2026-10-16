@@ -1,7 +1,11 @@
 """Group facts that state "the same rule" under one rule_key (ARCHITECTURE §5.5).
 
-Facts are first partitioned by normalised (unit, conditions) — hard constraints,
-so e.g. "levels L1-L3" and "levels L4+" can never merge. Within a partition the
+Facts are first partitioned by normalised conditions — a hard constraint, so
+e.g. "levels L1-L3" and "levels L4+" can never merge. Units are deliberately not
+a partition: the LLM names them inconsistently ("days", "paid sick days",
+"date", none), which split one rule into pieces where an outdated FAQ or a
+superseded version "won" on its own; the same rule in different units should
+meet and surface as a conflict anyway. Within a partition the
 fact keys ("topic: attribute") are embedded locally and clustered with average
 linkage on cosine distance at a conservative threshold (no single linkage: it
 chains unrelated rules). Implemented in numpy rather than scipy: it is a few
@@ -42,15 +46,6 @@ def _norm_words(text: str | None) -> str:
     if raw in _NONE_WORDS:
         return ""
     return " ".join(re.sub(r"[^a-z0-9.+]+", " ", raw.replace("–", "-")).split())
-
-
-def normalize_unit(unit: str | None) -> str:
-    """'Working days' / 'days' / 'business day' → 'day'; other units lowercased and singular."""
-    text = _norm_words(unit)
-    if text in _NONE_WORDS:
-        return ""
-    text = re.sub(r"\b(working|business)\s+", "", text)
-    return " ".join(w[:-1] if w.endswith("s") and len(w) > 3 else w for w in text.split())
 
 
 def normalize_conditions(conditions: str | None) -> str:
@@ -111,16 +106,16 @@ def assign_rule_keys(
     threshold: float = DEFAULT_THRESHOLD,
 ) -> list[Fact]:
     ordered = sorted(facts, key=lambda f: f.fact_id)
-    partitions: dict[tuple[str, str], list[Fact]] = defaultdict(list)
+    partitions: dict[str, list[Fact]] = defaultdict(list)
     for fact in ordered:
-        partitions[(normalize_unit(fact.unit), normalize_conditions(fact.conditions))].append(fact)
+        partitions[normalize_conditions(fact.conditions)].append(fact)
 
     texts = sorted({fact_key_text(f) for f in ordered})
     vectors = dict(zip(texts, embed(texts))) if texts else {}
 
     keyed: dict[str, Fact] = {}
     used: set[str] = set()
-    for (unit, conditions), members in sorted(partitions.items()):
+    for conditions, members in sorted(partitions.items()):
         matrix = np.stack([vectors[fact_key_text(f)] for f in members])
         docs = np.array([f.doc_id for f in members])
         key_texts = np.array([fact_key_text(f) for f in members])
@@ -131,8 +126,7 @@ def assign_rule_keys(
             clusters[int(label)].append(fact)
         for group in sorted(clusters.values(), key=lambda g: g[0].fact_id):
             base = _slug(fact_key_text(group[0]))
-            suffix = "|".join(p for p in (_slug(unit), _slug(conditions)) if p)
-            key = f"{base}|{suffix}" if suffix else base
+            key = f"{base}|{_slug(conditions)}" if conditions else base
             unique, n = key, 2
             while unique in used:
                 unique, n = f"{key}#{n}", n + 1

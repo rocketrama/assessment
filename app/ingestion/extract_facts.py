@@ -34,7 +34,7 @@ from app.llm.client import CorpusSegment, LLMClient
 
 log = logging.getLogger("veltrix.ingestion")
 
-EXTRACT_VERSION = "4"
+EXTRACT_VERSION = "5"
 BATCH_CORPUS_TOKENS = 1200
 MAX_FACTS_PER_CALL = 80
 CALL_TIMEOUT_SECONDS = 90.0
@@ -56,7 +56,7 @@ Rules:
 - value: copied exactly from the quote: a number ("12", "1.5", "10:00"), a date ("31 March"), or a short phrase \
 ("not allowed"). Never compute, convert or round.
 - unit: the unit as written ("working days", "weeks", "days per month", "EUR") or null.
-- conditions: only when the excerpt limits the rule to a subgroup or situation, in a few words ("levels L1-L3", "after probation", "primary caregiver"); otherwise null. Do not restate definitions or the topic. Never put a country, region, city or office in conditions: the document's region is known separately.
+- conditions: only when the excerpt limits the rule to a subgroup or situation, in a few words ("levels L1-L3", "after probation", "primary caregiver"); otherwise null. Do not restate definitions or the topic. Never put a country, region, city or office in conditions, and never a date, year or "from <date>" that only says when the document applies: the document's region and effective date are known separately.
 - quote: the shortest exact span of the excerpt that contains the value, copied character for character.
 - One fact per value. Rows of a table are separate facts.
 - Skip document metadata, contact details, headings without rules, and anything that is only an example.
