@@ -37,6 +37,8 @@
 
 Tools get `ToolContext(requester)` from the header, never identity from LLM args. LLM output and tool args are Pydantic-validated in strict mode; tool schemas sent to the LLM are generated from the same models. The planner never sees corpus text, so documents cannot trigger tools. Writes use a server-side proposal; only stored args execute on confirmation. Apply/cancel run in **`BEGIN IMMEDIATE`** transactions (WAL, busy timeout, `isolation_level=None`), re-validating every rule inside the lock so concurrent requests can't produce negative balances, overlaps or double refunds.
 
+**Assumption — `./data` is writable.** Sessions, messages and proposals are new tables in `veltrix.db` (not a separate file) so a proposal is claimed in the same transaction as the leave write it executes. Cost: the reviewers' DB gains three tables and is switched to WAL (`-wal`/`-shm` files appear beside it). Existing table schemas are never altered. Rejected: a separate `app.db`, which would need a cross-database transaction for confirm-and-apply.
+
 ## 5. Keeping personal data out of logs and prompts
 - Repositories never select `phone`; emails leave the data layer masked (`r***@domain`); `tool_calls` args are serialized through a masking model.
 - The planner sees employee IDs, role and region only; the composer gets names only for employees the requester may see, when needed.
