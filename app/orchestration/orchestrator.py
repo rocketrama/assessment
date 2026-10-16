@@ -23,7 +23,7 @@ from app.data.holidays import CalendarHolidays
 from app.data.sessions import delete_proposal, get_proposal, recent_messages
 from app.llm.client import CorpusSegment, LLMClient
 from app.orchestration.composer import build_corpus_input, compose
-from app.orchestration.dates import DateError, find_date_phrases, resolve_range, resolve_reference_date
+from app.orchestration.dates import DateError, find_date_phrases, find_date_range, resolve_range, resolve_reference_date
 from app.orchestration.planner import Plan, PlannedRead, plan_message
 from app.orchestration.proposals import (
     NOTHING_PENDING,
@@ -44,6 +44,14 @@ log = logging.getLogger("veltrix.orchestration")
 
 HISTORY_TURNS = 6
 _EMPLOYEE_ID_RE = re.compile(r"^[A-Za-z]{1,3}\d{2,8}$")
+# Deterministic bulk check (§7.3), in case the planner misses it: "everyone's balances",
+# "all employees", "every employee"… A manager's own team is handled by get_team_leave.
+_BULK_RE = re.compile(
+    r"\b(every\s*one|every\s*body|every\s+employee|all\s+(?:the\s+)?(?:employees|staff|people|managers)|"
+    r"each\s+employee|whole\s+(?:company|organi[sz]ation))",
+    re.IGNORECASE,
+)
+_PEOPLE_DATA_RE = re.compile(r"\b(balances?|requests?|on leave|days left|leave data|leave records?)\b", re.IGNORECASE)
 _EMPLOYEE_ID_IN_TEXT_RE = re.compile(r"\b[A-Za-z]{1,3}\d{2,8}\b")
 _SELF_WORDS = {"self", "me", "myself", "i", "my", "mine"}
 
@@ -132,7 +140,7 @@ def _tool_args(turn: Turn, read: PlannedRead) -> dict[str, Any]:
     if read.tool == "get_team_leave":
         if not authz.can_view_team(turn.requester):
             raise _Stop("refuse", NOT_A_MANAGER)
-        start, end = read.start, read.end
+        start, end = find_date_range(turn.message) or (read.start, read.end)  # the message wins
         if not start:  # the planner dropped dates the user gave: take them from the message
             found = find_date_phrases(turn.message)
             start, end = (found[0], found[1] if len(found) > 1 else None) if found else (None, None)
@@ -171,11 +179,18 @@ def _guard(plan: Plan, turn: Turn) -> None:
     if plan.intent == "greeting" and not plan.reads and not plan.policy_query:
         raise _Stop("clarify", GREETING)
     others = {r.employee for r in plan.reads if r.tool != "get_team_leave" and (r.employee or "self").casefold() not in _SELF_WORDS}
-    if plan.many_employees and not all(r.tool == "get_team_leave" for r in plan.reads):
+    # Eval finding: the planner called "Show me every employee's leave balance" a policy question.
+    wants_people_data = plan.intent == "leave_info" or bool(plan.reads) or _PEOPLE_DATA_RE.search(turn.message) is not None
+    bulk = plan.many_employees or (wants_people_data and _BULK_RE.search(turn.message) is not None)
+    only_team_leave = bool(plan.reads) and all(r.tool == "get_team_leave" for r in plan.reads)
+    if bulk and not only_team_leave:
         raise _Stop("refuse", BULK)
     if len(others) > 1:
         raise _Stop("refuse", BULK)  # at most one other employee per message (§7.3)
-    if plan.missing:
+    # Eval finding: the planner listed "leave type" as missing for a balance lookup. With a
+    # lookup or a search to run, missing details are checked where they matter (dates in
+    # _tool_args, write details in proposals), not taken from the plan.
+    if plan.missing and not plan.reads and not plan.policy_query:
         raise _Stop("clarify", "To answer, I need: " + ", ".join(plan.missing) + ".")
 
 
@@ -215,7 +230,7 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
         if plan.change is None:
             return stop("clarify", "Would you like to apply for leave or cancel a request, and for which dates?")
         previous = proposal if plan.intent == "modify" else None
-        return written(propose(plan.change, ctx, turn.session_id, turn.today, previous))
+        return written(propose(plan.change, ctx, turn.session_id, turn.today, previous, turn.message))
     if proposal is not None:
         delete_proposal(turn.conn, turn.session_id)  # anything else discards it
 
@@ -246,6 +261,7 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
         sent_ids = list(packed.chunk_ids) if packed else []
 
     if not tool_calls and not sent_ids:
+        log.info("no_answer", extra={"reason": "nothing retrieved or looked up"})
         return stop("no_answer", NO_ANSWER)
 
     composed = compose(
@@ -258,8 +274,13 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
     citations: list[Citation] = build_citations(used, sent_ids, turn.retriever.corpus) if turn.retriever else []
     if wants_docs and not citations and not tool_calls:
         # A policy answer with no supported citation is a guess: don't send it (§8.1).
+        log.info(
+            "no_answer",
+            extra={"reason": "no supported citation", "covered": composed.covered, "used": len(composed.used_chunk_ids)},
+        )
         return TurnResult(finalize(request_id, NO_ANSWER, "no_answer", hidden_names=hidden), corpus_tokens)
     if composed.covered == "none" or not composed.answer.strip():
+        log.info("no_answer", extra={"reason": "composer covered none"})
         return TurnResult(finalize(request_id, NO_ANSWER, "no_answer", hidden_names=hidden), corpus_tokens)
     route = route_for(citations, tool_calls)
     return TurnResult(

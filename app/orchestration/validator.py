@@ -3,10 +3,12 @@
 - Citations come only from passages that were actually sent to the composer
   and that it says it used: used ∩ sent. A citation can therefore never point
   to a document that wasn't retrieved, or that the requester may not read.
-- "Cite every document you used and no others" (§4.2): a passage whose facts
-  are in the rule table is kept only if one of its winning (or upcoming) values
+- "Cite every document you used and no others" (§4.2): a passage that holds an
+  outranked fact is kept only if one of its winning (or upcoming) values
   appears in the answer — so a superseded or lower-precedence source that the
-  model listed anyway is dropped. Passages without facts are kept as listed.
+  model listed anyway is dropped. Passages with no outranked facts are kept as
+  listed: the answer may rely on a statement the fact extraction didn't capture
+  (eval finding: the India addendum's "carried forward days do not expire").
 - The route is decided in code from what actually happened, and the response
   is forced to match the §8.1 table (citations / tool_calls empty or not).
 - Personal data: phones removed, emails masked, and full names of employees the
@@ -44,15 +46,15 @@ def grounded_chunk_ids(
     answer_lower = " ".join(answer.lower().split())
     answer_numbers = _numbers(answer)
     supporting: dict[str, list[str]] = {}  # chunk → its winning / upcoming values
-    mentioned: set[str] = set()  # chunks that appear in the rule table at all
+    outranked: set[str] = set()  # chunks holding at least one outranked fact
     for r in resolutions:
         for f in r.winners + r.upcoming:
             supporting.setdefault(f.chunk_id, []).append(f.value)
-        mentioned.update(f.chunk_id for f in r.winners + r.outranked + r.upcoming)
+        outranked.update(f.chunk_id for f in r.outranked)
     kept = []
     for chunk_id in used_chunk_ids:
-        if chunk_id not in mentioned:
-            kept.append(chunk_id)  # no facts in play: trust the composer's choice
+        if chunk_id not in outranked:
+            kept.append(chunk_id)  # nothing superseded in it: trust the composer's choice
         elif any(_value_in_answer(v, answer_lower, answer_numbers) for v in supporting.get(chunk_id, [])):
             kept.append(chunk_id)
     return kept

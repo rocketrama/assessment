@@ -32,10 +32,20 @@ def test_chunks_without_facts_are_trusted():
     assert grounded_chunk_ids(["CAL::001"], "Deepavali is on 9 November.", [CARRY]) == ["CAL::001"]
 
 
+def test_winning_source_is_kept_even_for_a_statement_not_extracted_as_a_fact():
+    """Eval finding: the answer relied on "carried forward days do not expire", which
+    the extraction missed; the addendum's recorded facts (15 days) aren't in the answer."""
+    addendum = RuleResolution("carry-in", winners=(F("ADD-IN::001", "15"),), outranked=(F("POL-V2::006", "10"),), upcoming=())
+    answer = "Carried-forward days in India do not expire on a fixed date."
+    assert grounded_chunk_ids(["ADD-IN::001", "POL-V2::006"], answer, [addendum]) == ["ADD-IN::001"]
+
+
 def test_number_words_match_digits():
+    # V2::005 also holds an outranked fact, so its winning value must be in the answer.
     r = RuleResolution("min", winners=(F("V2::005", "ten working days"),), outranked=(), upcoming=())
-    assert grounded_chunk_ids(["V2::005"], "Take at least 10 working days.", [r]) == ["V2::005"]
-    assert grounded_chunk_ids(["V2::005"], "Take at least 12 working days.", [r]) == []
+    lost = RuleResolution("other", winners=(F("ADD::001", "7"),), outranked=(F("V2::005", "9"),), upcoming=())
+    assert grounded_chunk_ids(["V2::005"], "Take at least 10 working days.", [r, lost]) == ["V2::005"]
+    assert grounded_chunk_ids(["V2::005"], "Take at least 12 working days.", [r, lost]) == []
 
 
 def test_upcoming_value_supports_a_citation():

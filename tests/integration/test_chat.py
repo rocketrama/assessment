@@ -312,3 +312,17 @@ def test_empty_composer_answer_is_never_sent(client, script):
     script.compose = lambda ids, user: {"answer": "  ", "used_chunk_ids": [], "covered": "full"}
     body = ask(client, script, "What's my balance?", plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
     assert body["route"] == "no_answer" and body["answer"].strip()
+
+
+def test_team_range_from_the_message_beats_the_plan(client, script):
+    """Eval finding: for "between 5 and 9 October" the planner passed only "9 October"."""
+    body = ask(client, script, "Who in my team is on leave between 5 and 9 October?",
+               plan("leave_info", reads=[{"tool": "get_team_leave", "start": "9 October"}]), employee="M2001")
+    assert body["tool_calls"][0]["args"] == {"start_date": "2026-10-05", "end_date": "2026-10-09"}
+
+
+def test_spurious_missing_items_do_not_block_a_lookup(client, script):
+    """Eval finding: the planner listed "leave type" as missing for a balance lookup."""
+    body = ask(client, script, "What's my balance?",
+               plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}], missing=["leave type"]))
+    assert body["route"] == "tool"

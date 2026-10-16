@@ -39,14 +39,30 @@ def test_same_rule_with_different_values_and_wording_shares_a_key():
     assert k["V1::005#f00"] == "sick-leave-days-per-year"
 
 
-def test_different_conditions_never_merge():
+def test_different_tiers_never_merge_even_when_they_embed_identically():
+    """Tiers embed ~0.09 apart in reality; here identically. Their numbers differ."""
+    _VECTORS["annual leave accrual: days per month (less than 2 years)"] = [0.0, 1.0, 0.1]
+    _VECTORS["annual leave accrual: days per month (2 years to less than 5 years)"] = [0.0, 1.0, 0.1]
     k = keys(
         [
-            F("A::001#f00", "annual leave accrual", "days per month", "1.5", "days per month", "less than 2 years"),
-            F("A::001#f01", "annual leave accrual", "days per month", "1.75", "days per month", "2 years to less than 5 years"),
+            F("A::001#f00", "annual leave accrual", "days per month", "1.5", "days per month", "less than 2 years", doc="A"),
+            F("B::001#f00", "annual leave accrual", "days per month", "1.75", "days per month", "2 years to less than 5 years", doc="B"),
         ]
     )
     assert len(set(k.values())) == 2
+
+
+def test_tier_in_topic_meets_tier_in_conditions():
+    """Eval finding: the schedule wrote the tier as a condition, v3 into the topic."""
+    _VECTORS["annual leave: days earned per month (less than 2 years)"] = [0.0, 1.0, 0.3]
+    _VECTORS["annual leave accrual: less than 2 years of service"] = [0.0, 1.0, 0.32]
+    k = keys(
+        [
+            F("TBL::001#f00", "annual leave", "days earned per month", "1.5", None, "less than 2 years", doc="TBL"),
+            F("V3::001#f00", "annual leave accrual", "less than 2 years of service", "1.5", None, None, doc="V3"),
+        ]
+    )
+    assert k["TBL::001#f00"] == k["V3::001#f00"]
 
 
 def test_unrelated_rules_stay_apart():
@@ -82,6 +98,25 @@ def test_units_do_not_split_a_rule():
 
 def test_condition_normalisation():
     assert normalize_conditions("N/A") == ""
+
+
+import pytest  # noqa: E402
+
+
+@pytest.mark.parametrize(
+    "conditions", ["Employees in India", "employees in Germany", "Staff based in the Berlin office", "for employees of Veltrix Systems Inc."]
+)
+def test_where_only_conditions_are_no_condition(conditions):
+    """Eval finding: the model writes the region into conditions despite the prompt,
+    which split the India addendum away from the global rule it overrides."""
+    assert normalize_conditions(conditions) == ""
+
+
+@pytest.mark.parametrize(
+    "conditions", ["levels L1-L3", "employees with 5 or more years of service", "primary caregiver", "employees in India after probation"]
+)
+def test_real_conditions_are_kept(conditions):
+    assert normalize_conditions(conditions) != ""
     assert normalize_conditions("Levels L1–L3") == normalize_conditions("levels l1-l3")
     assert normalize_conditions("All employees") == normalize_conditions(None) == ""
 

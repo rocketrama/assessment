@@ -76,6 +76,31 @@ def test_ranges():
         resolve_range("21 September", "Friday", TODAY)
 
 
+@pytest.mark.parametrize(
+    "start, end, expected",
+    [
+        ("21", "23 September", ("2026-09-21", "2026-09-23")),  # "from 21 to 23 September"
+        ("1", "30 October", ("2026-10-01", "2026-10-30")),
+        ("5", "9 October", ("2026-10-05", "2026-10-09")),
+        ("Monday 21 September 2026", "Friday", ("2026-09-21", "2026-09-25")),
+    ],
+)
+def test_ranges_as_people_write_them(start, end, expected):
+    from app.orchestration.dates import resolve_end
+
+    if end == "Friday":  # end phrases relative to the start go through resolve_end
+        s = resolve_date(start, TODAY)
+        assert (s.isoformat(), resolve_end(end, s, TODAY).isoformat()) == expected
+    else:
+        r = resolve_range(start, end, TODAY)
+        assert (r.start.isoformat(), r.end.isoformat()) == expected
+
+
+def test_bare_day_without_a_month_alone_is_not_understood():
+    with pytest.raises(DateError):
+        resolve_range("21", None, TODAY)
+
+
 def test_range_ending_before_start_without_years_is_ambiguous():
     with pytest.raises(DateError):
         resolve_range("28 December", "2 January", TODAY)
@@ -113,3 +138,20 @@ def test_find_date_phrases(message, phrases):
     from app.orchestration.dates import find_date_phrases
 
     assert find_date_phrases(message) == phrases
+
+
+@pytest.mark.parametrize(
+    "message, expected",
+    [
+        ("Please book annual leave from 21 to 23 September.", ("21", "23 September")),
+        ("Who in my team is on leave between 5 and 9 October?", ("5", "9 October")),
+        ("annual leave 21-23 Sept", ("21", "23 Sept")),
+        ("from 28 December 2026 to 4 January 2027", ("28 December 2026", "4 January 2027")),
+        ("Book annual leave on 21 September.", None),
+        ("Make it until Friday instead", None),
+    ],
+)
+def test_find_date_range(message, expected):
+    from app.orchestration.dates import find_date_range
+
+    assert find_date_range(message) == expected

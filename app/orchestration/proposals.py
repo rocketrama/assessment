@@ -23,7 +23,7 @@ from app.api.schemas import ToolCall
 from app.data.db import transaction
 from app.data.leave import ACTIVE_STATUSES, LeaveRequest, list_requests
 from app.data.sessions import Proposal, save_proposal, take_proposal
-from app.orchestration.dates import DateError, resolve_date, resolve_end, resolve_range
+from app.orchestration.dates import DateError, find_date_phrases, find_date_range, resolve_date, resolve_end, resolve_range
 from app.orchestration.planner import PlannedChange
 from app.tools.registry import TOOLS, ToolContext
 
@@ -83,11 +83,16 @@ def _apply_args(change: PlannedChange, base: dict[str, Any] | None, today: date)
     start = date.fromisoformat(base["start_date"]) if base.get("start_date") else None
     end = date.fromisoformat(base["end_date"]) if base.get("end_date") else None
     try:
-        if change.start:
+        end_done = False
+        if change.start and change.end and re.fullmatch(r"\s*\d{1,2}(?:st|nd|rd|th)?\s*", change.start):
+            # "from 21 to 23 September": the bare start day takes the end's month.
+            span = resolve_range(change.start, change.end, today, allow_past=False)
+            start, end, end_done = span.start, span.end, True
+        elif change.start:
             span = resolve_range(change.start, None, today, allow_past=False)
             keep_old_end = end is not None and span.start == span.end and end >= span.start and not change.end
             start, end = span.start, (end if keep_old_end else span.end)
-        if change.end and start is not None:
+        if change.end and start is not None and not end_done:
             end = resolve_end(change.end, start, today)
             if end < today:
                 raise DateError(change.end, "past")
@@ -104,6 +109,21 @@ def _apply_args(change: PlannedChange, base: dict[str, Any] | None, today: date)
     if missing:
         return WriteOutcome("To book leave I need " + " and ".join(missing) + ".", "clarify")
     return {"leave_type": leave_type, "start_date": start.isoformat(), "end_date": (end or start).isoformat()}
+
+
+def _from_message(change: PlannedChange, message: str) -> PlannedChange:
+    """The user's own words beat the planner's copy (eval finding: the live planner
+    dropped "annual" and passed "21" for "from 21 to 23 September"). A leave type is
+    taken only when the message names exactly one — that is the user saying it, not
+    an assumption (§6.2)."""
+    updates: dict[str, Any] = {}
+    if change.leave_type is None:
+        named = {t for t in ("annual", "sick") if re.search(rf"\b{t}\b", message, re.IGNORECASE)}
+        if len(named) == 1:
+            updates["leave_type"] = named.pop()
+    if span := find_date_range(message):
+        updates["start"], updates["end"] = span
+    return change.model_copy(update=updates) if updates else change
 
 
 def _cancellable(conn: sqlite3.Connection, employee_id: str, today: date) -> list[LeaveRequest]:
@@ -168,9 +188,14 @@ def propose(
     session_id: str,
     today: date,
     previous: Proposal | None = None,
+    message: str = "",
 ) -> WriteOutcome:
     tool_name = "apply_leave" if change.action == "apply" else "cancel_leave"
     base = previous.args if previous and previous.tool_name == tool_name else None
+    if tool_name == "apply_leave":
+        change = _from_message(change, message)
+    elif not change.request_id and not change.start and (found := find_date_phrases(message)):
+        change = change.model_copy(update={"start": found[0]})  # "cancel my leave on 6 October"
     args = _apply_args(change, base, today) if tool_name == "apply_leave" else _cancel_args(change, ctx, today)
     if isinstance(args, WriteOutcome):
         return args

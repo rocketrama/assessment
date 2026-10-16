@@ -51,7 +51,11 @@ def _next_weekday(today: date, weekday: int) -> date:
 
 
 def _explicit(text: str) -> date | None:
-    """ISO, '21 september [2026]', 'september 21 [2026]', '21/09/2026', '21.9'."""
+    """ISO, '21 september [2026]', 'september 21 [2026]', '21/09/2026', '21.9';
+    a leading weekday name ('monday 21 september 2026') is ignored."""
+    words = text.split(" ")
+    if len(words) > 1 and words[0] in _WEEKDAYS:
+        text = " ".join(words[1:])
     if m := re.fullmatch(r"(\d{4})-(\d{1,2})-(\d{1,2})", text):
         return date(int(m[1]), int(m[2]), int(m[3]))
     if m := re.fullmatch(r"(\d{1,2}) ([a-z]+)(?: (\d{4}))?", text):
@@ -103,8 +107,18 @@ def resolve_range(start_phrase: str, end_phrase: str | None, today: date, allow_
     if phrases == {"next week"}:
         monday = today + timedelta(days=7 - today.weekday())
         return DateRange(monday, monday + timedelta(days=4))
-    start = resolve_date(start_phrase, today, allow_past)
-    end = resolve_date(end_phrase, today, allow_past) if end_phrase else start
+    end = resolve_date(end_phrase, today, allow_past) if end_phrase else None
+    if end is not None and re.fullmatch(r"\d{1,2}", _clean(start_phrase)):
+        # "from 21 to 23 September": the start borrows the end's month and year.
+        try:
+            start = end.replace(day=int(_clean(start_phrase)))
+        except ValueError:
+            raise DateError(start_phrase, "not_understood") from None
+        if not allow_past and start < today:
+            raise DateError(start_phrase, "past")
+    else:
+        start = resolve_date(start_phrase, today, allow_past)
+    end = end or start
     if end < start and not re.search(r"\d{4}", end_phrase or ""):
         # "28 December to 2 January" without years is outside the leave year.
         raise DateError(end_phrase or start_phrase, "ambiguous")
@@ -158,3 +172,20 @@ def find_date_phrases(message: str) -> list[str]:
     """Date phrases in a message, in order — the fallback when the planner left
     the dates out although the user gave them."""
     return [m.group(0) for m in _PHRASE_RE.finditer(message)]
+
+
+_DAY = r"\d{1,2}(?:st|nd|rd|th)?"
+_MONTH = "(?:" + "|".join(sorted(_MONTHS, key=len, reverse=True)) + ")"
+_FULL = rf"(?:{_DAY} (?:of )?{_MONTH}\b(?: \d{{4}})?|{_MONTH} {_DAY}(?:,? \d{{4}})?|\d{{4}}-\d{{1,2}}-\d{{1,2}})"
+_RANGE_RE = re.compile(
+    rf"(?:\bfrom |\bbetween )?\b({_FULL}|{_DAY})\s*(?:-|\u2013|\u2014|\bto\b|\band\b|\buntil\b|\btill\b|\bthrough\b)\s*({_FULL})",
+    re.IGNORECASE,
+)
+
+
+def find_date_range(message: str) -> tuple[str, str] | None:
+    """An explicit range written in the message ("from 21 to 23 September",
+    "between 5 and 9 October", "21-23 Sept") as (start phrase, end phrase).
+    The message is the ground truth: this beats the planner's copy of it."""
+    m = _RANGE_RE.search(message)
+    return (m.group(1), m.group(2)) if m else None

@@ -1,22 +1,25 @@
 """Group facts that state "the same rule" under one rule_key (ARCHITECTURE §5.5).
 
-Facts are first partitioned by normalised conditions — a hard constraint, so
-e.g. "levels L1-L3" and "levels L4+" can never merge. Units are deliberately not
-a partition: the LLM names them inconsistently ("days", "paid sick days",
-"date", none), which split one rule into pieces where an outdated FAQ or a
-superseded version "won" on its own; the same rule in different units should
-meet and surface as a conflict anyway. Within a partition the
-fact keys ("topic: attribute") are embedded locally and clustered with average
-linkage on cosine distance at a conservative threshold (no single linkage: it
-chains unrelated rules). Implemented in numpy rather than scipy: it is a few
-lines, and one dependency fewer to break. Values are never part
-of the key: the same rule with different values must land together so the
-conflict surfaces. A document states each rule once, so two facts from the same
-document with different keys are never merged (cannot-link): this keeps e.g.
-"primary caregiver weeks" and "secondary caregiver weeks" apart even though
-their keys embed almost identically. Region, date and document type are left out too; precedence
-handles them. Over-merging is worse than under-merging (a wrong silent winner
-vs a missed conflict), so the threshold stays tight.
+Each fact's key is "topic: attribute (conditions)" — conditions are part of the
+compared text, not a separate exact-match partition. The LLM is inconsistent
+about where it writes a qualifier: the accrual schedule put the service tier
+in conditions ("less than 2 years") while v3 wrote it into the topic ("accrual:
+less than 2 years of service"); an exact partition kept them apart, so the rule
+table showed no current accrual rate at all (eval finding).
+
+Keys are embedded locally and clustered with average linkage on cosine distance
+at a conservative threshold (no single linkage: it chains unrelated rules), in
+numpy rather than scipy (blocked on the dev machine; a few lines). Two hard
+cannot-link constraints, deterministic and untuned:
+- same document, different key: a document states each rule once ("primary
+  caregiver weeks" vs "secondary caregiver weeks" embed almost identically);
+- different numbers in the keys: tiers and levels ("less than 2 years" vs
+  "2 to less than 5 years", "L1-L3" vs "L4-L5") are only ~0.09 apart as
+  embeddings, but their numbers differ, so they are different rules.
+Units are not part of the key (the LLM names them inconsistently); values never
+are — the same rule with different values must meet so the conflict surfaces.
+Region, date and document type are left out; precedence handles them.
+Over-merging is worse than under-merging, so the threshold stays tight.
 
 Input is sorted by fact_id, so the result is reproducible.
 """
@@ -48,13 +51,35 @@ def _norm_words(text: str | None) -> str:
     return " ".join(re.sub(r"[^a-z0-9.+]+", " ", raw.replace("–", "-")).split())
 
 
+# "employees in india", "staff based in the berlin office", "for employees of veltrix gmbh":
+# says only who works where. The document's region comes from the manifest, so this is
+# no subgroup at all — the prompt forbids it, but the live model still writes it.
+_CONDITION_WORDS = r"after|before|with|without|who|whose|during|while|on|from|until|if|when|over|under|than|and|or|for"
+_PLACE = rf"(?:(?!(?:{_CONDITION_WORDS})\b)[a-z.+-]+ ?){{1,4}}"  # at most 4 words, none starting a real condition
+_WHERE_ONLY_RE = re.compile(
+    rf"^(?:for |applies to )?(?:all )?(?:employees|employee|staff)"
+    rf"(?: (?:in|based in|of|at|working in|employed by|located in)(?: the)? {_PLACE})?(?: office)?$"
+)
+
+
 def normalize_conditions(conditions: str | None) -> str:
     text = _norm_words(conditions)
-    return "" if text in _NONE_WORDS else text
+    if text in _NONE_WORDS or _WHERE_ONLY_RE.match(text):
+        return ""
+    return text
 
 
 def fact_key_text(fact: Fact) -> str:
-    return f"{fact.topic.strip().lower()}: {fact.attribute.strip().lower()}"
+    key = f"{fact.topic.strip().lower()}: {fact.attribute.strip().lower()}"
+    conditions = normalize_conditions(fact.conditions)
+    return f"{key} ({conditions})" if conditions else key
+
+
+_KEY_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def key_numbers(key_text: str) -> frozenset[str]:
+    return frozenset(_KEY_NUMBER_RE.findall(key_text))
 
 
 def _slug(text: str) -> str:
@@ -69,7 +94,7 @@ def average_linkage_labels(
     length. `cannot_link[i, j]` True forbids rows i and j from ever sharing a
     cluster (their distance is infinite, and the average stays infinite after
     merges). Ties merge the lowest indices first, so the result is deterministic.
-    (Partitions hold at most a few hundred keys, so the O(n³) loop is cheap.)"""
+    (A corpus has a few hundred facts, so the O(n³) loop is cheap.)"""
     n = len(vectors)
     labels = list(range(n))
     if n < 2:
@@ -106,31 +131,31 @@ def assign_rule_keys(
     threshold: float = DEFAULT_THRESHOLD,
 ) -> list[Fact]:
     ordered = sorted(facts, key=lambda f: f.fact_id)
-    partitions: dict[str, list[Fact]] = defaultdict(list)
-    for fact in ordered:
-        partitions[normalize_conditions(fact.conditions)].append(fact)
-
+    if not ordered:
+        return []
     texts = sorted({fact_key_text(f) for f in ordered})
-    vectors = dict(zip(texts, embed(texts))) if texts else {}
+    vectors = dict(zip(texts, embed(texts)))
 
+    keys = [fact_key_text(f) for f in ordered]
+    matrix = np.stack([vectors[k] for k in keys])
+    docs = np.array([f.doc_id for f in ordered])
+    key_arr = np.array(keys)
+    numbers = [key_numbers(k) for k in keys]
+    same_doc_other_key = (docs[:, None] == docs[None, :]) & (key_arr[:, None] != key_arr[None, :])
+    different_numbers = np.array([[bool(a and b and a != b) for b in numbers] for a in numbers])
+    labels = average_linkage_labels(matrix, threshold, same_doc_other_key | different_numbers)
+
+    clusters: dict[int, list[Fact]] = defaultdict(list)
+    for label, fact in zip(labels, ordered):
+        clusters[int(label)].append(fact)
     keyed: dict[str, Fact] = {}
     used: set[str] = set()
-    for conditions, members in sorted(partitions.items()):
-        matrix = np.stack([vectors[fact_key_text(f)] for f in members])
-        docs = np.array([f.doc_id for f in members])
-        key_texts = np.array([fact_key_text(f) for f in members])
-        cannot_link = (docs[:, None] == docs[None, :]) & (key_texts[:, None] != key_texts[None, :])
-        labels = average_linkage_labels(matrix, threshold, cannot_link)
-        clusters: dict[int, list[Fact]] = defaultdict(list)
-        for label, fact in zip(labels, members):
-            clusters[int(label)].append(fact)
-        for group in sorted(clusters.values(), key=lambda g: g[0].fact_id):
-            base = _slug(fact_key_text(group[0]))
-            key = f"{base}|{_slug(conditions)}" if conditions else base
-            unique, n = key, 2
-            while unique in used:
-                unique, n = f"{key}#{n}", n + 1
-            used.add(unique)
-            for fact in group:
-                keyed[fact.fact_id] = replace(fact, rule_key=unique)
+    for group in sorted(clusters.values(), key=lambda g: g[0].fact_id):
+        key = _slug(fact_key_text(group[0]))
+        unique, n = key, 2
+        while unique in used:
+            unique, n = f"{key}#{n}", n + 1
+        used.add(unique)
+        for fact in group:
+            keyed[fact.fact_id] = replace(fact, rule_key=unique)
     return [keyed[f.fact_id] for f in facts]

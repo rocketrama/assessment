@@ -9,8 +9,8 @@ import threading
 
 import pytest
 
-from app.data.db import connect
-from app.data.leave import get_balances, list_requests
+from app.data.db import connect, transaction
+from app.data.leave import get_balances, insert_request, list_requests
 from app.data.sessions import get_proposal
 from app.orchestration.proposals import NOTHING_PENDING, UNCLEAR_CONFIRMATION, is_clear_confirmation
 from tests.integration.test_chat import ask, check_route_invariants, client, plan, script  # noqa: F401 (fixtures)
@@ -215,3 +215,24 @@ def test_clear_confirmations(text):
 )
 def test_not_confirmations(text):
     assert not is_clear_confirmation(text)
+
+
+def test_users_own_words_beat_a_sloppy_plan(client, script):
+    """Eval finding: the live planner dropped "annual" and passed "21" as the start."""
+    body = ask(client, script, "Please book annual leave from 21 to 23 September.",
+               apply_plan(start="21", end="23 September"))
+    assert body["pending_confirmation"] is True
+    assert body["tool_calls"][0]["args"] == {"leave_type": "annual", "start_date": "2026-09-21", "end_date": "2026-09-23"}
+
+
+def test_two_leave_types_in_the_message_are_still_asked_about(client, script):
+    body = ask(client, script, "Book annual or sick leave on 21 September?", apply_plan(start="21 September"))
+    assert body["route"] == "clarify" and "leave type" in body["answer"]
+
+
+def test_cancel_date_from_the_message_when_the_plan_drops_it(client, script, tmp_path):
+    """Eval finding: the planner dropped "6 October" and the user got "which request?"."""
+    with db(tmp_path) as conn, transaction(conn):
+        insert_request(conn, "E1001", "annual", "2026-11-02", "2026-11-03", 2)
+    body = ask(client, script, "Cancel my leave on 6 October", plan("leave_change", change={"action": "cancel"}))
+    assert body["tool_calls"][0]["args"] == {"request_id": "REQ-FIX-0001"}

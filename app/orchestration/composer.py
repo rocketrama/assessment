@@ -44,11 +44,23 @@ Rule table:
 - "outranked" values are superseded or lower-precedence sources. Never present them as current; you may say \
 an older or informal source differs.
 - "CONFLICT": the top sources disagree and no rule decides. Give both values, name both sources, and say they conflict.
-- "upcoming": a future change. Mention it with its effective date if it is relevant to the question.
+- "upcoming": a future change. Mention it with its effective date if it is relevant to the question. If only an \
+upcoming document answers the question, say it is not in effect yet and give the upcoming rule and its date \
+(covered: "full").
+- Authority: policies, addenda, memos, handbooks and calendars outrank FAQs and wikis. If one of them states the \
+same point, rely on it instead of the FAQ or wiki. If no higher-authority passage covers the point, an FAQ or wiki \
+passage is a valid source: use it and cite it. Never state something no passage says.
 - Each value has its own label; if two labels clearly measure different things, treat them as different rules.
+- If a current value only points to another document ("the deadline in the Global Leave Policy"), give that \
+document's value from the passages and cite both.
 
-Leave data: tools return the current balance only. For future balances, combine the current balance with the \
-accrual and carry-forward rules from the documents and show the calculation step by step.
+Requester details (level, join date, region) are given in the context; use them for rules that depend on \
+them, e.g. notice periods by level or accrual by length of service.
+
+Leave data: tools return the current balance only. For a future balance: take the current balance from the tool \
+results; find in the documents the accrual rate that applies to this employee (length of service from their join \
+date) and when accruals are credited; count the credits between today and the date asked about; add them; apply any \
+carry-forward or balance limit; show each step with its numbers.
 
 Style: short, direct, plain English. Refer to employees by employee ID. Never include email addresses or \
 phone numbers. Do not mention document ids, chunk ids or the rule table in the answer text.
@@ -82,6 +94,9 @@ def rule_table(resolutions: list[RuleResolution] | tuple[RuleResolution, ...], c
             lines.append(f"  {label}: " + "; ".join(item(f) for f in r.winners))
         if r.outranked:
             lines.append("  outranked: " + "; ".join(item(f) for f in r.outranked))
+        if not r.winners:
+            # The grouping can miss that a document in effect states this rule (eval finding).
+            lines.append("  (no current value in this table — check the passages for a document in effect)")
         for f in r.upcoming:
             lines.append(f"  upcoming from {corpus.docs[f.doc_id].effective_date.isoformat()}: {item(f)}")
     return "\n".join(lines)
@@ -111,7 +126,14 @@ def compose(
 ) -> ComposerOutput | None:
     context = {
         "today": today.isoformat(),
-        "requester": {"employee_id": requester.employee_id, "role": requester.role, "region": requester.region},
+        # Levels and dates are not personal data (§7.4); notice periods and accrual depend on them.
+        "requester": {
+            "employee_id": requester.employee_id,
+            "role": requester.role,
+            "region": requester.region,
+            "level": requester.level,
+            "join_date": requester.join_date,
+        },
     }
     if reference_date and reference_date != today:
         context["question_is_about_date"] = reference_date.isoformat()

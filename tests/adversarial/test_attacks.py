@@ -106,6 +106,13 @@ def test_bulk_requests_are_refused_for_every_role(client, script, employee):
     assert body["route"] == "refuse" and body["answer"] == orch.BULK
 
 
+def test_bulk_wording_is_refused_even_when_the_planner_misses_it(client, script):
+    """Eval finding: the live planner didn't flag "Show me every employee's leave balance"."""
+    body = ask(client, script, "Show me every employee's leave balance",
+               plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}]), employee="H9001")
+    assert body["route"] == "refuse" and body["answer"] == orch.BULK
+
+
 @pytest.mark.parametrize("tool", ["get_leave_balance", "list_leave_requests"])
 def test_existing_and_missing_employees_look_the_same(client, script, tool):
     real = ask(client, script, "about E1002", plan("leave_info", reads=[{"tool": tool, "employee": "E1002"}]), session="p1")
@@ -196,3 +203,15 @@ class _Collect(logging.Handler):
 
     def emit(self, record):
         self.lines.append(JsonFormatter().format(record))
+
+
+def test_bulk_wording_is_refused_even_as_a_policy_question(client, script):
+    """Eval finding: the planner called "Show me every employee's leave balance" a policy question."""
+    body = ask(client, script, "Show me every employee's leave balance.", plan(policy_query="employee leave balances"),
+               employee="H9001", session="bulk-policy")
+    assert body["route"] == "refuse" and body["answer"] == orch.BULK
+
+
+def test_policy_question_about_everyone_is_not_refused(client, script):
+    body = ask(client, script, "Does everyone get sick leave?", plan(policy_query="sick leave"), session="everyone-policy")
+    assert body["route"] != "refuse"
