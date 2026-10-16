@@ -1,0 +1,31 @@
+# Reviewers supply their own ./data (TASK.pdf §10.1, §11.2); it may contain personal data
+data/
+
+# Ingestion cache and index: corpus-derived, rebuilt at startup, never committed (§4.1)
+cache/
+*.db
+*.faiss
+
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Eval outputs
+eval/results/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.png
+!docs/*.png

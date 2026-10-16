@@ -1,0 +1,6 @@
+# Keep LF line endings so files work inside the Linux Docker image
+* text=auto eol=lf
+*.pdf binary
+*.docx binary
+*.png binary
+*.jpg binary
