@@ -29,12 +29,13 @@ class RegexFactProvider:
         return json.dumps({"facts": facts})
 
 
-def write_corpus(root: Path) -> tuple[Path, Path]:
-    """Writes corpus/ and manifest.json under `root`; returns (corpus_dir, manifest_path)."""
+def write_corpus(root: Path, extra_docs: dict | None = None) -> tuple[Path, Path]:
+    """Writes corpus/ and manifest.json under `root`; returns (corpus_dir, manifest_path).
+    `extra_docs` adds documents in the same (type, regions, date, access, text) form."""
     corpus = root / "corpus"
     corpus.mkdir()
     manifest = []
-    for doc_id, (doc_type, regions, effective, access, sentence) in DOCS.items():
+    for doc_id, (doc_type, regions, effective, access, sentence) in {**DOCS, **(extra_docs or {})}.items():
         (corpus / f"{doc_id}.md").write_text(f"# {doc_id}\n\n## Sick leave\n\n{sentence}\n", encoding="utf-8")
         manifest.append({"doc_id": doc_id, "file": f"{doc_id}.md", "title": doc_id, "doc_type": doc_type,
                          "regions": regions, "effective_date": effective, "access_level": access})

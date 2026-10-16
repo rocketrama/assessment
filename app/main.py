@@ -111,6 +111,7 @@ def create_app(
         if not state.ready:
             raise HTTPException(status_code=503, detail="service is starting")
         started = time.perf_counter()
+        deadline = time.monotonic() + settings.request_budget_seconds  # §9.1: 30 s per request
         request_id = str(uuid.uuid4())
         requester = _requester(request)
         with connect(settings.db_path) as conn:
@@ -133,6 +134,7 @@ def create_app(
                 llm=state.llm,
                 retriever=state.retriever,
                 cache_db=cache_db_path(settings.cache_dir),
+                deadline=deadline,
             )
             result = handle_turn(turn, request_id)
             response = result.response

@@ -107,6 +107,7 @@ def compose(
     segments: list[CorpusSegment],
     tool_results: list[dict[str, Any]],
     notes: list[str],
+    deadline: float | None = None,
 ) -> ComposerOutput | None:
     context = {
         "today": today.isoformat(),
@@ -130,6 +131,7 @@ def compose(
             max_tokens=2500,
             timeout=COMPOSER_TIMEOUT_SECONDS,
             validate=ComposerOutput.model_validate,
+            deadline=deadline,
         )
     except Exception as exc:
         log.warning("composer failed", extra={"error": type(exc).__name__})

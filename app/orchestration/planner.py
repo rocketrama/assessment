@@ -123,6 +123,7 @@ def plan_message(
     today: date,
     history: list[Message],
     pending_proposal: str | None,
+    deadline: float | None = None,
 ) -> Plan | None:
     """The validated plan, or None when the LLM fails or returns an unusable plan."""
     context = {
@@ -143,6 +144,7 @@ def plan_message(
             max_tokens=1500,
             timeout=PLANNER_TIMEOUT_SECONDS,
             validate=Plan.model_validate,
+            deadline=deadline,
         )
     except Exception as exc:
         log.warning("planner failed", extra={"error": type(exc).__name__})

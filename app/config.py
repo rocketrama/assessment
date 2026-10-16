@@ -28,6 +28,8 @@ class Settings(BaseSettings):
     llm_timeout_seconds: float = 12.0
     # Sent as reasoning_effort to OpenAI-compatible reasoning models (e.g. gpt-oss); empty = not sent
     llm_reasoning_effort: str = ""
+    # Time budget for the LLM calls of one /chat request; the spec allows 30 s (§9.1)
+    request_budget_seconds: float = 25.0
     # Ingestion must leave /health time to reach 200 within 10 minutes (must-pass #1)
     ingestion_budget_seconds: float = 480.0
 

@@ -5,6 +5,10 @@
   tokens (must-pass #4), then wraps it in <documents> delimiters as untrusted data.
 - Every call is logged with purpose, model, corpus_tokens and latency.
 - Temperature 0; one retry on timeouts, rate limits and server errors.
+- An optional `deadline` (time.monotonic) caps each attempt to the time left
+  for the whole request (§9.1: 30 s per /chat); no attempt starts with less
+  than MIN_CALL_SECONDS left, so a slow provider ends in a safe reply, not a
+  timed-out request.
 - `complete_json` extracts a JSON object from the reply (tolerating code fences
   and <think> blocks) and makes one repair call if it is invalid.
 """
@@ -23,6 +27,7 @@ from app.tokens import count_tokens
 log = logging.getLogger("veltrix.llm")
 
 CORPUS_TOKEN_LIMIT = 3000
+MIN_CALL_SECONDS = 2.0
 REPAIR_INSTRUCTION = (
     "Your previous reply was not a valid JSON object of the requested shape. "
     "Reply again with only that JSON object and nothing else."
@@ -35,6 +40,10 @@ class CorpusBudgetError(Exception):
 
 class LLMError(Exception):
     """The provider failed after retries."""
+
+
+class DeadlineExceeded(LLMError):
+    """Not enough of the request's time budget left to make (another) call."""
 
 
 @dataclass(frozen=True)
@@ -165,6 +174,7 @@ class LLMClient:
         corpus: Sequence[CorpusSegment] = (),
         max_tokens: int = 1024,
         timeout: float | None = None,
+        deadline: float | None = None,
     ) -> LLMResult:
         corpus_tokens = sum(count_tokens(s.text) for s in corpus)
         if corpus_tokens > CORPUS_TOKEN_LIMIT:
@@ -174,9 +184,16 @@ class LLMClient:
 
         last_exc: Exception | None = None
         for attempt in range(1, self.retries + 2):
+            call_timeout = timeout or self.timeout
+            if deadline is not None:
+                remaining = deadline - time.monotonic()
+                if remaining < MIN_CALL_SECONDS:
+                    log.warning("llm call skipped: request deadline", extra={"purpose": purpose, "attempt": attempt})
+                    raise DeadlineExceeded(purpose) from last_exc
+                call_timeout = min(call_timeout, remaining)
             started = time.perf_counter()
             try:
-                text = self.provider.chat(self.model, system, prompt, max_tokens, timeout or self.timeout)
+                text = self.provider.chat(self.model, system, prompt, max_tokens, call_timeout)
             except Exception as exc:
                 latency = round((time.perf_counter() - started) * 1000, 1)
                 log.warning(
@@ -219,6 +236,7 @@ class LLMClient:
         max_tokens: int = 1024,
         timeout: float | None = None,
         validate=None,
+        deadline: float | None = None,
     ) -> dict[str, Any] | None:
         """The reply as a JSON object, or None after one failed repair attempt.
         `validate(obj)` may reject a parsed object (e.g. a Pydantic check)."""
@@ -234,7 +252,9 @@ class LLMClient:
             except Exception:
                 return False
 
-        first = self.complete(purpose=purpose, system=system, user=user, corpus=corpus, max_tokens=max_tokens, timeout=timeout)
+        first = self.complete(
+            purpose=purpose, system=system, user=user, corpus=corpus, max_tokens=max_tokens, timeout=timeout, deadline=deadline
+        )
         obj = extract_json_object(first.text)
         if ok(obj):
             return obj
@@ -245,6 +265,7 @@ class LLMClient:
             corpus=corpus,
             max_tokens=max_tokens,
             timeout=timeout,
+            deadline=deadline,
         )
         obj = extract_json_object(repair.text)
         return obj if ok(obj) else None

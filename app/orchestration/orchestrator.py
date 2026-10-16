@@ -82,6 +82,7 @@ class Turn:
     llm: LLMClient | None
     retriever: Retriever | None
     cache_db: str
+    deadline: float | None = None  # time.monotonic() by which the LLM calls must be done
 
 
 @dataclass
@@ -197,7 +198,9 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
     if turn.llm is None:
         return stop("no_answer", UNAVAILABLE)
     history = recent_messages(turn.conn, turn.session_id, HISTORY_TURNS)
-    plan = plan_message(turn.llm, turn.message, turn.requester, turn.today, history, proposal.summary if proposal else None)
+    plan = plan_message(
+        turn.llm, turn.message, turn.requester, turn.today, history, proposal.summary if proposal else None, turn.deadline
+    )
     if plan is None:
         return stop("no_answer", UNAVAILABLE)
 
@@ -245,7 +248,9 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
     if not tool_calls and not sent_ids:
         return stop("no_answer", NO_ANSWER)
 
-    composed = compose(turn.llm, turn.message, turn.requester, turn.today, reference, segments, tool_results, [])
+    composed = compose(
+        turn.llm, turn.message, turn.requester, turn.today, reference, segments, tool_results, [], turn.deadline
+    )
     corpus_tokens = sum(count_tokens(s.text) for s in segments) if composed is not None else 0
     if composed is None or (not composed.answer.strip() and composed.covered != "none"):
         return stop("no_answer", UNAVAILABLE)  # never send an empty answer

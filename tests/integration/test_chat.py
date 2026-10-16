@@ -7,7 +7,9 @@ precedence, tools with permission checks, routes, citations and PII scrubbing.
 import json
 import logging
 import re
+import time
 from collections.abc import Iterator
+from contextlib import contextmanager
 
 import pytest
 from fastapi.testclient import TestClient
@@ -38,9 +40,18 @@ class ChatScript:
         self.plans: dict[str, object] = {}
         self.compose = None
         self.composer_prompts: list[str] = []
+        self.planner_prompts: list[str] = []
+        self.delay = 0.0  # seconds per call; like a real SDK, the call fails at `timeout`
+        self.timeouts: list[float] = []
 
     def chat(self, model, system, user, max_tokens, timeout):
+        self.timeouts.append(timeout)
+        if self.delay:
+            time.sleep(min(self.delay, timeout))
+            if self.delay > timeout:
+                raise TimeoutError("provider took too long")
         if system.startswith("You plan"):
+            self.planner_prompts.append(user)
             reply = self.plans[user.rsplit("Message:\n", 1)[1]]
             if isinstance(reply, Exception):
                 raise reply
@@ -60,20 +71,27 @@ def script() -> ChatScript:
     return ChatScript()
 
 
-@pytest.fixture
-def client(tmp_path, script) -> Iterator[TestClient]:
+@contextmanager
+def chat_app(tmp_path, script, extra_docs=None, retries=0, **overrides) -> Iterator[TestClient]:
+    """The real app over the fixture DB and policy corpus, with a scripted chat LLM."""
     db = tmp_path / "veltrix.db"
     build_fixture_db(str(db))
-    corpus, manifest = write_corpus(tmp_path)
+    corpus, manifest = write_corpus(tmp_path, extra_docs)
     settings = Settings(_env_file=None, db_path=str(db), corpus_dir=str(corpus), manifest_path=str(manifest),
-                        cache_dir=str(tmp_path / "cache"), app_today="2026-09-15")
+                        cache_dir=str(tmp_path / "cache"), app_today="2026-09-15", **overrides)
 
     def ingest(s):
         run_ingestion(s, PageOcr(vision=None, use_tesseract=False),
                       llm=LLMClient(RegexFactProvider(), "facts"), embedder=HashingEmbedder())
 
-    with TestClient(create_app(settings, ingest=ingest, llm=LLMClient(script, "chat", retries=0))) as c:
+    with TestClient(create_app(settings, ingest=ingest, llm=LLMClient(script, "chat", retries=retries))) as c:
         wait_ready(c)
+        yield c
+
+
+@pytest.fixture
+def client(tmp_path, script) -> Iterator[TestClient]:
+    with chat_app(tmp_path, script) as c:
         yield c
 
 
