@@ -30,7 +30,7 @@
 | Identity, role, region from DB only; missing/unknown header → 401 | `app/main.py::resolve_requester` |
 | Session ownership → 403 | `data/sessions.py::assert_owner` |
 | Restricted docs never searched or sent | `retrieval/eligibility.py::allowed_chunk_ids` → `retrieval/index.py::search(allowed_ids=…)` |
-| Leave-data permissions | `tools/authz.py::can_view_employee`, `can_view_team`, `assert_self`, called inside every tool in `tools/registry.py` |
+| Leave-data permissions | `tools/authz.py::can_view_employee`, `can_view_team`, `owns_request`, called inside every tool in `tools/registry.py` |
 | Same refusal for denied and non-existent employees | `tools/authz.py` → single `ACCESS_DENIED` |
 | Bulk requests refused | `orchestration/orchestrator.py::guard_plan` |
 | Citations only from used ∩ allowed chunks | `orchestration/validator.py::build_citations` |

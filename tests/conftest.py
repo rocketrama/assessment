@@ -41,11 +41,16 @@ def wait_ready(client: TestClient, timeout: float = 10.0) -> None:
 
 
 @pytest.fixture
-def db_conn(tmp_path) -> Iterator[sqlite3.Connection]:
-    """A connection to a fresh synthetic DB with the app tables added."""
-    db_path = str(tmp_path / "repo.db")
-    build_fixture_db(db_path)
-    init_app_tables(db_path)
+def db_path(tmp_path) -> str:
+    """A fresh synthetic DB with the app tables added."""
+    path = str(tmp_path / "repo.db")
+    build_fixture_db(path)
+    init_app_tables(path)
+    return path
+
+
+@pytest.fixture
+def db_conn(db_path) -> Iterator[sqlite3.Connection]:
     with connect(db_path) as conn:
         yield conn
 

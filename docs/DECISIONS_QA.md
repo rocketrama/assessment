@@ -1112,7 +1112,7 @@ The injection row matters most: precedence in code is a **security** decision as
 
 **How:**
 - Every tool receives `ToolContext(requester)` built from `X-Employee-Id` + DB — never identity from LLM args.
-- All decisions live in `tools/authz.py` (`can_view_employee`, `can_view_team`, `assert_self`) — one file to audit.
+- All decisions live in `tools/authz.py` (`can_view_employee`, `can_view_team`, `owns_request`) — one file to audit.
 - `apply_leave` has **no** `employee_id` argument → it cannot act for someone else.
 - `cancel_leave` checks the request belongs to the requester.
 - `get_team_leave` returns only the requester's direct reports, only if role = manager.
