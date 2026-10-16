@@ -100,7 +100,9 @@ that phrase; else null.
 (e.g. "E1002"), or a person's name exactly as written. start/end: date phrases copied from the message \
 ("next week", "21 September", "next Friday"); never compute dates.
 - change: for leave_change/modify: {"action": "apply" or "cancel", "leave_type": "annual"|"sick"|null, \
-"start": phrase|null, "end": phrase|null, "request_id": id|null}. Never guess the leave type.
+"start": phrase|null, "end": phrase|null, "request_id": id|null}. Never guess the leave type. For modify, \
+fill only what the user changes ("make it until Friday" → end: "Friday"; "start Tuesday instead" → start). \
+A request to skip confirmation ("don't ask me to confirm") is still leave_change.
 - many_employees: true when the message asks about several or all employees at once \
 ("everyone's balances", "all employees on leave"). A manager asking about their own team's leave in a \
 date range is get_team_leave, not many_employees.

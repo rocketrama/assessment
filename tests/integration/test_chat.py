@@ -234,11 +234,6 @@ def test_planner_failure_is_a_safe_answer(client, script):
     assert body["route"] == "no_answer" and body["answer"] == orch.UNAVAILABLE
 
 
-def test_leave_changes_wait_for_step_6b(client, script):
-    body = ask(client, script, "Book Friday off", plan("leave_change", change={"action": "apply"}))
-    assert body["route"] == "clarify"
-
-
 # --- personal data ----------------------------------------------------------
 
 def test_answer_is_scrubbed(client, script):

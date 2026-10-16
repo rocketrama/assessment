@@ -1,5 +1,9 @@
 """One chat turn: plan → guard → tools / retrieval → compose → validate (ARCHITECTURE §9).
 
+Write actions branch off before the read path (proposals.py): a clear "yes"
+executes the stored proposal without even calling the planner; changed details
+make a new proposal; any other message discards a waiting proposal (§8.2).
+
 The LLM proposes (planner) and writes (composer); everything in between is code:
 date resolution, who may be asked about, bulk-request refusal, tool calls with
 their own permission checks, retrieval over eligible documents only, and the
@@ -16,11 +20,20 @@ from typing import Any
 from app.api.schemas import ChatResponse, Citation, ToolCall
 from app.data.employees import Employee, find_by_name, get_employee
 from app.data.holidays import CalendarHolidays
-from app.data.sessions import get_proposal, recent_messages
+from app.data.sessions import delete_proposal, get_proposal, recent_messages
 from app.llm.client import CorpusSegment, LLMClient
 from app.orchestration.composer import build_corpus_input, compose
 from app.orchestration.dates import DateError, find_date_phrases, resolve_range, resolve_reference_date
 from app.orchestration.planner import Plan, PlannedRead, plan_message
+from app.orchestration.proposals import (
+    NOTHING_PENDING,
+    UNCLEAR_CONFIRMATION,
+    WriteOutcome,
+    execute,
+    is_clear_confirmation,
+    looks_like_confirmation,
+    propose,
+)
 from app.orchestration.validator import build_citations, finalize, grounded_chunk_ids, route_for
 from app.retrieval.retriever import Retriever
 from app.tokens import count_tokens
@@ -51,7 +64,6 @@ NO_ANSWER = (
 )
 UNAVAILABLE = "Sorry, I couldn't process that just now. Please try again in a moment."
 GREETING = f"Hello! {CAN_HELP}"
-WRITES_NOT_YET = "Applying for or cancelling leave in chat isn't available yet. You can still ask about policies and your leave."
 _DATE_REASONS = {
     "past": "that date has already passed",
     "ambiguous": "that date could mean more than one day",
@@ -157,8 +169,6 @@ def _guard(plan: Plan, turn: Turn) -> None:
         raise _Stop("refuse", OFF_TOPIC)
     if plan.intent == "greeting" and not plan.reads and not plan.policy_query:
         raise _Stop("clarify", GREETING)
-    if plan.intent in ("leave_change", "confirm", "modify") or plan.change is not None:
-        raise _Stop("clarify", WRITES_NOT_YET)  # step 6b
     others = {r.employee for r in plan.reads if r.tool != "get_team_leave" and (r.employee or "self").casefold() not in _SELF_WORDS}
     if plan.many_employees and not all(r.tool == "get_team_leave" for r in plan.reads):
         raise _Stop("refuse", BULK)
@@ -174,13 +184,37 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
     def stop(route: str, answer: str) -> TurnResult:
         return TurnResult(finalize(request_id, answer, route, hidden_names=hidden))
 
+    def written(outcome: WriteOutcome) -> TurnResult:
+        return TurnResult(
+            finalize(request_id, outcome.answer, outcome.route, (), outcome.tool_calls, outcome.pending, hidden)
+        )
+
+    ctx = ToolContext(turn.requester, turn.conn, turn.today, CalendarHolidays(turn.cache_db, turn.requester, turn.today))
+    proposal = get_proposal(turn.conn, turn.session_id)
+    if is_clear_confirmation(turn.message):  # decided in code, no LLM needed
+        return written(execute(ctx, turn.session_id)) if proposal else stop("clarify", NOTHING_PENDING)
+
     if turn.llm is None:
         return stop("no_answer", UNAVAILABLE)
     history = recent_messages(turn.conn, turn.session_id, HISTORY_TURNS)
-    proposal = get_proposal(turn.conn, turn.session_id)
     plan = plan_message(turn.llm, turn.message, turn.requester, turn.today, history, proposal.summary if proposal else None)
     if plan is None:
         return stop("no_answer", UNAVAILABLE)
+
+    # Write actions (§8.2). Never executed without a stored proposal and a clear yes.
+    if plan.intent == "confirm":
+        if proposal is None:
+            return stop("clarify", NOTHING_PENDING)
+        if looks_like_confirmation(turn.message):
+            return written(execute(ctx, turn.session_id))
+        return stop("clarify", UNCLEAR_CONFIRMATION)  # the proposal stays
+    if plan.intent in ("leave_change", "modify"):
+        if plan.change is None:
+            return stop("clarify", "Would you like to apply for leave or cancel a request, and for which dates?")
+        previous = proposal if plan.intent == "modify" else None
+        return written(propose(plan.change, ctx, turn.session_id, turn.today, previous))
+    if proposal is not None:
+        delete_proposal(turn.conn, turn.session_id)  # anything else discards it
 
     try:
         _pin_mentioned_ids(plan, turn)
@@ -190,7 +224,6 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
         return stop(s.route, s.answer)
 
     # Read tools: each runs its own permission check again (§6.1).
-    ctx = ToolContext(turn.requester, turn.conn, turn.today, CalendarHolidays(turn.cache_db, turn.requester, turn.today))
     tool_calls: list[ToolCall] = []
     tool_results: list[dict[str, Any]] = []
     for name, args in planned_calls:

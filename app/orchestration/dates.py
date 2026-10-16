@@ -111,6 +111,15 @@ def resolve_range(start_phrase: str, end_phrase: str | None, today: date, allow_
     return DateRange(start, end)
 
 
+def resolve_end(phrase: str, start: date, today: date) -> date:
+    """End of a leave range. A bare weekday ("until Friday") means the first such
+    day on or after the start — for leave starting Monday 21 September, "Friday"
+    is the 25th, not the Friday before it. Other phrases resolve as usual."""
+    if m := re.fullmatch(r"(?:this )?(" + "|".join(_WEEKDAYS) + r")", _clean(phrase)):
+        return start + timedelta(days=(_WEEKDAYS.index(m[1]) - start.weekday()) % 7)
+    return resolve_date(phrase, today)
+
+
 def resolve_reference_date(phrase: str | None, today: date) -> date | None:
     """The past date a policy question is about (§5), or None for today.
 
