@@ -9,6 +9,16 @@
   for the whole request (§9.1: 30 s per /chat); no attempt starts with less
   than MIN_CALL_SECONDS left, so a slow provider ends in a safe reply, not a
   timed-out request.
+- That cap is a wall-clock limit: the provider call runs in a worker thread and
+  the client stops waiting at its timeout (+ HARD_CAP_GRACE_SECONDS). The SDK's
+  own timeout is not one: eval round 6 had a 35.1 s /chat although every
+  attempt was capped at 12 s. An abandoned call finishes in the background and
+  its reply is ignored.
+- An optional `hedge_after` sends the same call a second time when the first has
+  not answered by then, and takes whichever reply comes first, within the same
+  cap. A provider stall is not a slow answer: measured planner calls take 2.1 s
+  median and 4.3 s at most, yet eval runs had calls hang for the full 12 s, twice
+  in a row. Waiting longer doesn't help with a stalled call; a second one does.
 - `complete_json` extracts a JSON object from the reply (tolerating code fences
   and <think> blocks) and makes one repair call if it is invalid.
 """
@@ -18,6 +28,7 @@ import logging
 import re
 import time
 from collections.abc import Sequence
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -28,6 +39,9 @@ log = logging.getLogger("veltrix.llm")
 
 CORPUS_TOKEN_LIMIT = 3000
 MIN_CALL_SECONDS = 2.0
+HARD_CAP_GRACE_SECONDS = 0.5
+# Worker threads for provider calls; abandoned (timed-out) calls keep a thread until the SDK gives up.
+_CALLS = ThreadPoolExecutor(max_workers=32, thread_name_prefix="llm-call")
 REPAIR_INSTRUCTION = (
     "Your previous reply was not a valid JSON object of the requested shape. "
     "Reply again with only that JSON object and nothing else."
@@ -64,10 +78,12 @@ class Provider(Protocol):
 
 
 class OpenAICompatibleProvider:
-    """OpenAI, or any OpenAI-compatible endpoint such as NVIDIA (LLM_BASE_URL)."""
+    """OpenAI, or an OpenAI-compatible endpoint such as NVIDIA or Gemini (LLM_BASE_URL)."""
 
     def __init__(self, api_key: str, base_url: str | None = None, reasoning_effort: str = "") -> None:
-        from openai import OpenAI
+        from importlib import import_module
+
+        OpenAI = import_module("openai").OpenAI
 
         self._client = OpenAI(api_key=api_key, base_url=base_url, max_retries=0)
         # gpt-oss on NVIDIA: "low" cut a fact-extraction call from ~54 s to ~8 s.
@@ -85,9 +101,35 @@ class OpenAICompatibleProvider:
         return response.choices[0].message.content or ""
 
 
+# Default endpoint when LLM_BASE_URL is empty; OpenAI itself uses the SDK default.
+_DEFAULT_BASE_URLS = {
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "google": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "openrouter": "https://openrouter.ai/api/v1",
+    "mistral": "https://api.mistral.ai/v1",
+}
+
+
+def openai_compatible_endpoint(settings: Settings) -> tuple[str, str | None]:
+    """(API key, base URL) for an OpenAI-compatible provider; the key is "" when unset.
+    Shared by text calls and vision OCR."""
+    provider = settings.llm_provider
+    keys = {
+        "openai": settings.openai_api_key,
+        "nvidia": settings.nvidia_api_key,
+        "gemini": settings.google_api_key,
+        "google": settings.google_api_key,
+        "openrouter": settings.openrouter_api_key,
+        "mistral": settings.mistral_api_key,
+    }
+    return keys.get(provider, ""), settings.llm_base_url or _DEFAULT_BASE_URLS.get(provider)
+
+
 class AnthropicProvider:
     def __init__(self, api_key: str) -> None:
-        from anthropic import Anthropic
+        from importlib import import_module
+
+        Anthropic = import_module("anthropic").Anthropic
 
         self._client = Anthropic(api_key=api_key, max_retries=0)
 
@@ -124,6 +166,23 @@ def render_corpus(segments: Sequence[CorpusSegment]) -> str:
     return "\n\n<documents>\n" + "\n".join(parts) + "\n</documents>"
 
 
+MAX_REPORTED_ERRORS = 5
+
+
+def describe_validation_error(exc: Exception) -> str:
+    """Pydantic errors as "field.path: message"; anything else by its class name.
+    Input values are left out on purpose (see complete_json)."""
+    errors = getattr(exc, "errors", None)
+    if callable(errors):
+        try:
+            parts = [f"{'.'.join(str(p) for p in e['loc']) or 'reply'}: {e['msg']}" for e in errors()]
+        except Exception:
+            parts = []
+        if parts:
+            return "; ".join(parts[:MAX_REPORTED_ERRORS])
+    return f"the reply has the wrong shape ({type(exc).__name__})"
+
+
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
@@ -158,12 +217,42 @@ class LLMClient:
                 return None
             provider: Provider = AnthropicProvider(settings.anthropic_api_key)
         else:
-            key = {"nvidia": settings.nvidia_api_key, "openai": settings.openai_api_key}.get(provider_name)
+            key, base_url = openai_compatible_endpoint(settings)
             if not key:
                 log.warning("LLM disabled: no API key for provider", extra={"provider": provider_name})
                 return None
-            provider = OpenAICompatibleProvider(key, settings.llm_base_url or None, settings.llm_reasoning_effort)
+            provider = OpenAICompatibleProvider(key, base_url, settings.llm_reasoning_effort)
         return cls(provider, settings.llm_model, timeout=settings.llm_timeout_seconds)
+
+    def _call(
+        self, purpose: str, system: str, prompt: str, max_tokens: int, call_timeout: float, hedge_after: float | None
+    ) -> str:
+        """One attempt, capped at call_timeout (+ grace) of wall-clock time; optionally hedged.
+        Raises the provider's error when every call sent has failed, TimeoutError at the cap."""
+        start = time.monotonic()
+        stop = start + call_timeout + HARD_CAP_GRACE_SECONDS
+        hedge_at = start + hedge_after if hedge_after and call_timeout - hedge_after >= MIN_CALL_SECONDS else None
+        pending: list[Future] = [_CALLS.submit(self.provider.chat, self.model, system, prompt, max_tokens, call_timeout)]
+        first_exc: Exception | None = None
+        while True:
+            until = hedge_at if hedge_at is not None else stop
+            done, _ = wait(pending, timeout=max(0.0, until - time.monotonic()), return_when=FIRST_COMPLETED)
+            for future in done:
+                pending.remove(future)
+                try:
+                    return future.result()
+                except Exception as exc:
+                    first_exc = first_exc or exc
+            if not pending:  # every call sent failed: the caller's retry logic decides what next
+                raise first_exc  # type: ignore[misc]
+            now = time.monotonic()
+            if hedge_at is not None and now >= hedge_at:
+                hedge_at = None
+                log.info("llm call hedged", extra={"purpose": purpose, "after_ms": round((now - start) * 1000, 1)})
+                left = stop - HARD_CAP_GRACE_SECONDS - now
+                pending.append(_CALLS.submit(self.provider.chat, self.model, system, prompt, max_tokens, left))
+            elif hedge_at is None and now >= stop:
+                raise TimeoutError(f"no reply within {call_timeout:.1f}s")
 
     def complete(
         self,
@@ -175,6 +264,7 @@ class LLMClient:
         max_tokens: int = 1024,
         timeout: float | None = None,
         deadline: float | None = None,
+        hedge_after: float | None = None,
     ) -> LLMResult:
         corpus_tokens = sum(count_tokens(s.text) for s in corpus)
         if corpus_tokens > CORPUS_TOKEN_LIMIT:
@@ -193,7 +283,8 @@ class LLMClient:
                 call_timeout = min(call_timeout, remaining)
             started = time.perf_counter()
             try:
-                text = self.provider.chat(self.model, system, prompt, max_tokens, call_timeout)
+                # Raises TimeoutError (retryable) when the provider overruns its timeout.
+                text = self._call(purpose, system, prompt, max_tokens, call_timeout, hedge_after)
             except Exception as exc:
                 latency = round((time.perf_counter() - started) * 1000, 1)
                 log.warning(
@@ -210,7 +301,11 @@ class LLMClient:
                 last_exc = exc
                 if attempt > self.retries or not _is_retryable(exc):
                     break
-                time.sleep(3.0 if "RateLimit" in type(exc).__name__ else 1.0)
+                pause = 3.0 if "RateLimit" in type(exc).__name__ else 1.0
+                if deadline is not None and deadline - time.monotonic() - pause < MIN_CALL_SECONDS:
+                    log.warning("llm call skipped: request deadline", extra={"purpose": purpose, "attempt": attempt + 1})
+                    raise DeadlineExceeded(purpose) from exc  # no time for a retry: don't wait for it
+                time.sleep(pause)
                 continue
             latency = round((time.perf_counter() - started) * 1000, 1)
             log.info(
@@ -237,35 +332,48 @@ class LLMClient:
         timeout: float | None = None,
         validate=None,
         deadline: float | None = None,
+        hedge_after: float | None = None,
     ) -> dict[str, Any] | None:
         """The reply as a JSON object, or None after one failed repair attempt.
-        `validate(obj)` may reject a parsed object (e.g. a Pydantic check)."""
+        `validate(obj)` may reject a parsed object (e.g. a Pydantic check).
+
+        The repair request says what was wrong (field paths and messages, never the
+        rejected values: those may quote corpus text). Eval finding: told only "not a
+        valid JSON object of the requested shape", the planner repeated the same
+        function-call shape ({"name": ..., "args": ...} instead of {"tool": ...})."""
+        problem = ""
 
         def ok(obj: dict[str, Any] | None) -> bool:
+            nonlocal problem
             if obj is None:
+                problem = "the reply contained no JSON object"
                 return False
             if validate is None:
                 return True
             try:
                 validate(obj)
                 return True
-            except Exception:
+            except Exception as exc:
+                problem = describe_validation_error(exc)
                 return False
 
         first = self.complete(
-            purpose=purpose, system=system, user=user, corpus=corpus, max_tokens=max_tokens, timeout=timeout, deadline=deadline
+            purpose=purpose, system=system, user=user, corpus=corpus, max_tokens=max_tokens, timeout=timeout,
+            deadline=deadline, hedge_after=hedge_after,
         )
         obj = extract_json_object(first.text)
         if ok(obj):
             return obj
+        log.warning("llm reply rejected", extra={"purpose": purpose, "error": problem})
         repair = self.complete(
             purpose=f"{purpose}:repair",
             system=system,
-            user=f"{user}\n\n{REPAIR_INSTRUCTION}",
+            user=f"{user}\n\n{REPAIR_INSTRUCTION} What was wrong: {problem}.",
             corpus=corpus,
             max_tokens=max_tokens,
             timeout=timeout,
             deadline=deadline,
+            hedge_after=hedge_after,
         )
         obj = extract_json_object(repair.text)
         return obj if ok(obj) else None

@@ -12,6 +12,7 @@ import pytest
 from app.data.db import connect, transaction
 from app.data.leave import get_balances, insert_request, list_requests
 from app.data.sessions import get_proposal
+from app.orchestration.planner import INCOMPLETE_CHANGE_NOTE
 from app.orchestration.proposals import NOTHING_PENDING, UNCLEAR_CONFIRMATION, is_clear_confirmation
 from tests.integration.test_chat import ask, check_route_invariants, client, plan, script  # noqa: F401 (fixtures)
 
@@ -114,6 +115,49 @@ def test_changed_details_make_a_new_proposal(client, script, tmp_path):
     assert "5 working days" in body["answer"]
     yes(client)
     assert annual(tmp_path) == 7.0
+
+
+@pytest.mark.parametrize("action", ["modify", None])
+def test_a_modify_keeps_the_pending_action_whatever_the_planner_wrote(client, script, action):
+    ask(client, script, "Annual leave 21-23 Sept", apply_plan(leave_type="annual", start="21 September", end="23 September"))
+    body = ask(client, script, "Make it until Friday instead",
+               plan("modify", change={"action": action, "end": "Friday"}))
+    assert body["pending_confirmation"] is True
+    assert body["tool_calls"][0]["name"] == "apply_leave"
+    assert body["tool_calls"][0]["args"]["end_date"] == "2026-09-25"
+
+
+def test_a_new_change_without_an_action_is_asked_about(client, script, tmp_path):
+    body = ask(client, script, "Sort out my leave for 21 September",
+               plan("leave_change", change={"action": "modify", "start": "21 September"}))
+    assert body["route"] == "clarify" and body["pending_confirmation"] is False
+    assert "apply for leave or cancel" in body["answer"]
+    with db(tmp_path) as conn:
+        assert get_proposal(conn, "s1") is None
+
+
+def test_a_booking_plan_without_details_is_asked_for_once_more(client, script):
+    message = "Please book annual leave from 21 to 23 September."
+    script.plans[f"{message}\n\n{INCOMPLETE_CHANGE_NOTE}"] = apply_plan(
+        leave_type="annual", start="21 September", end="23 September")
+    body = ask(client, script, message, plan("leave_change"))  # intent right, change left out
+    assert len(script.planner_prompts) == 2
+    assert body["pending_confirmation"] is True
+    assert body["tool_calls"][0]["args"] == {"leave_type": "annual", "start_date": "2026-09-21", "end_date": "2026-09-23"}
+
+
+def test_a_vague_change_is_asked_about_after_one_more_try(client, script):
+    message = "I want to change my leave"
+    script.plans[f"{message}\n\n{INCOMPLETE_CHANGE_NOTE}"] = plan("leave_change")  # still no action
+    body = ask(client, script, message, plan("leave_change"))
+    assert len(script.planner_prompts) == 2
+    assert body["route"] == "clarify" and "apply for leave or cancel" in body["answer"]
+
+
+def test_a_plan_that_lists_what_is_missing_is_not_retried(client, script):
+    body = ask(client, script, "I want some time off", plan("leave_change", missing=["leave type", "dates"]))
+    assert len(script.planner_prompts) == 1
+    assert body["route"] == "clarify"
 
 
 def test_anything_else_discards_the_proposal(client, script, tmp_path):

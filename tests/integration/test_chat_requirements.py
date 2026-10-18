@@ -139,3 +139,27 @@ class _Collect(logging.Handler):
 
     def emit(self, record):
         self.entries.append(json.loads(JsonFormatter().format(record)))
+
+
+def test_bulk_flag_written_as_the_intent_is_still_refused(tmp_path, script):
+    """Eval finding: the planner wrote "intent": "many_employees"; the repair repeated it."""
+    with chat_app(tmp_path, script) as c:
+        body = ask(c, script, "Show me every employee's leave balance.",
+                   plan("many_employees", many_employees=True), employee="H9001")
+        assert body["route"] == "refuse"
+        assert len(script.planner_prompts) == 1  # accepted, not repaired
+
+
+def test_a_question_planned_as_a_booking_with_nothing_to_book_is_answered(tmp_path, script):
+    """Eval finding: "how long can I stay home?" was planned as leave_change in 6 of 11 replies."""
+    with chat_app(tmp_path, script) as c:
+        body = ask(c, script, "My grandmother passed away, how long can I stay home?",
+                   plan("leave_change", policy_query="bereavement leave", missing=["leave type", "dates"]))
+        assert body["route"] == "rag" and body["citations"]
+
+
+def test_a_booking_with_dates_is_not_turned_into_a_question(tmp_path, script):
+    with chat_app(tmp_path, script) as c:
+        body = ask(c, script, "Book bereavement leave on 21 September",
+                   plan("leave_change", policy_query="bereavement leave", missing=["leave type"]))
+        assert body["route"] == "clarify"

@@ -4,7 +4,14 @@ from datetime import date
 
 import pytest
 
-from app.orchestration.dates import DateError, resolve_date, resolve_range, resolve_reference_date
+from app.orchestration.dates import (
+    DateError,
+    find_month_period,
+    resolve_date,
+    resolve_end,
+    resolve_range,
+    resolve_reference_date,
+)
 
 TODAY = date(2026, 9, 15)  # Tuesday
 D = date.fromisoformat
@@ -155,3 +162,31 @@ def test_find_date_range(message, expected):
     from app.orchestration.dates import find_date_range
 
     assert find_date_range(message) == expected
+
+
+@pytest.mark.parametrize(
+    "message, start, end",
+    [
+        ("Is anyone in my team off next month?", date(2026, 10, 1), date(2026, 10, 31)),
+        ("Who is on leave this month?", date(2026, 9, 1), date(2026, 9, 30)),
+        ("Team leave in December?", date(2026, 12, 1), date(2026, 12, 31)),
+        ("Who is off during feb 2027?", date(2027, 2, 1), date(2027, 2, 28)),
+    ],
+)
+def test_month_period(message, start, end):
+    period = find_month_period(message, TODAY)
+    assert (period.start, period.end) == (start, end)
+
+
+@pytest.mark.parametrize("message", ["Who may be off next week?", "Who is off on 5 October?", "What is my balance?"])
+def test_no_month_period(message):
+    assert find_month_period(message, TODAY) is None
+
+
+def test_a_weekday_with_its_year_is_that_weekday():
+    """Eval finding: the planner turned "until Friday" into "Friday 2026"."""
+    assert resolve_date("Friday 2026", TODAY) == date(2026, 9, 18)
+    assert resolve_date("next Friday, 2026", TODAY) == date(2026, 9, 18)
+    assert resolve_end("Friday 2026", date(2026, 9, 21), TODAY) == date(2026, 9, 25)
+    with pytest.raises(DateError):
+        resolve_date("Friday 2027", TODAY)  # the coming Friday is not in 2027

@@ -30,6 +30,7 @@ from app.tools.registry import TOOLS, ToolContext
 NOTHING_PENDING = "There's nothing waiting for your confirmation."
 CONFIRM_PROMPT = "Shall I go ahead? Reply \"yes\" to confirm, or tell me what to change."
 UNCLEAR_CONFIRMATION = "Please reply \"yes\" to confirm, or tell me what to change."
+ASK_CHANGE = "Would you like to apply for leave or cancel a request, and for which dates?"
 
 _CONFIRM_WORDS = (
     "yes", "y", "yeah", "yep", "yup", "sure", "ok", "okay", "confirm", "confirmed", "go ahead", "go for it",
@@ -190,8 +191,12 @@ def propose(
     previous: Proposal | None = None,
     message: str = "",
 ) -> WriteOutcome:
+    if change.action is None and previous is not None:  # a modify keeps what is pending
+        change = change.model_copy(update={"action": "apply" if previous.tool_name == "apply_leave" else "cancel"})
+    if change.action is None:
+        return WriteOutcome(ASK_CHANGE, "clarify")
     tool_name = "apply_leave" if change.action == "apply" else "cancel_leave"
-    base = previous.args if previous and previous.tool_name == tool_name else None
+    base =previous.args if previous and previous.tool_name == tool_name else None
     if tool_name == "apply_leave":
         change = _from_message(change, message)
     elif not change.request_id and not change.start and (found := find_date_phrases(message)):

@@ -1,6 +1,7 @@
 """LLMClient: the 3,000 corpus-token guard, logging, retries and JSON handling (TASK.pdf §4.3)."""
 
 import json
+import time
 import logging
 
 import pytest
@@ -138,3 +139,71 @@ def test_complete_json_validator_rejects_wrong_shape():
 
     provider = FakeProvider(['{"other": 1}', '{"facts": [1]}'])
     assert LLMClient(provider, "m").complete_json(purpose="t", system="s", user="u", validate=validate) == {"facts": [1]}
+
+
+def test_repair_says_what_was_wrong_without_the_rejected_values():
+    """Eval finding: told only "wrong shape", the planner repeated {"name", "args"} reads."""
+    from pydantic import BaseModel
+
+    class Read(BaseModel):
+        tool: str
+
+    class Out(BaseModel):
+        reads: list[Read]
+
+    provider = FakeProvider([
+        '{"reads": [{"name": "list_leave_requests", "args": {"employee": "E1004"}}]}',
+        '{"reads": [{"tool": "list_leave_requests"}]}',
+    ])
+    obj = LLMClient(provider, "m").complete_json(purpose="t", system="s", user="u", validate=Out.model_validate)
+    assert obj == {"reads": [{"tool": "list_leave_requests"}]}
+    repair = provider.calls[1]["user"]
+    assert "What was wrong: reads.0.tool: Field required" in repair
+    assert "E1004" not in repair  # rejected values are never echoed (they may quote corpus text)
+
+
+def test_repair_names_a_missing_json_object():
+    provider = FakeProvider(["Sure! Here is the plan.", '{"facts": []}'])
+    LLMClient(provider, "m").complete_json(purpose="t", system="s", user="u")
+    assert "What was wrong: the reply contained no JSON object" in provider.calls[1]["user"]
+
+
+class StallingProvider:
+    """The first call hangs (a provider stall), later calls answer at once."""
+
+    def __init__(self, stall: float, reply: str = "ok"):
+        self.stall, self.reply = stall, reply
+        self.timeouts: list[float] = []
+
+    def chat(self, model, system, user, max_tokens, timeout):
+        self.timeouts.append(timeout)
+        if len(self.timeouts) == 1:
+            time.sleep(min(self.stall, timeout))
+            raise APITimeoutError("stalled")
+        return self.reply
+
+
+def test_a_stalled_call_is_hedged_and_the_second_reply_wins(llm_logs):
+    provider = StallingProvider(stall=3.0)
+    started = time.monotonic()
+    result = LLMClient(provider, "m", timeout=4.0, retries=0).complete(
+        purpose="planner", system="s", user="u", hedge_after=0.2)
+    assert result.text == "ok"
+    assert time.monotonic() - started < 1.5  # did not wait for the stalled call
+    assert len(provider.timeouts) == 2 and provider.timeouts[1] < 4.0  # the hedge shares the attempt's cap
+    assert any(e["msg"] == "llm call hedged" for e in llm_logs)
+
+
+def test_a_fast_reply_sends_no_hedge():
+    provider = FakeProvider(["ok"])
+    LLMClient(provider, "m", timeout=4.0).complete(purpose="planner", system="s", user="u", hedge_after=0.5)
+    time.sleep(0.6)
+    assert len(provider.calls) == 1
+
+
+def test_no_hedge_when_too_little_of_the_cap_would_be_left():
+    provider = StallingProvider(stall=0.5)
+    with pytest.raises(LLMError):
+        LLMClient(provider, "m", timeout=1.0, retries=0).complete(
+            purpose="planner", system="s", user="u", hedge_after=0.2)  # 0.8 s left < MIN_CALL_SECONDS
+    assert len(provider.timeouts) == 1

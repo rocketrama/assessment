@@ -4,7 +4,7 @@ import time
 
 import pytest
 
-from app.llm.client import MIN_CALL_SECONDS, DeadlineExceeded, LLMClient
+from app.llm.client import HARD_CAP_GRACE_SECONDS, MIN_CALL_SECONDS, DeadlineExceeded, LLMClient, LLMError
 
 
 class APITimeoutError(Exception):
@@ -22,6 +22,26 @@ class Recorder:
         if isinstance(reply, Exception):
             raise reply
         return reply
+
+
+def test_a_provider_that_ignores_its_timeout_is_cut_off():
+    """Wall-clock cap: the SDK timeout alone let a /chat reach 35.1 s (eval round 6)."""
+
+    provider = Recorder(["too late"], delay=3.0)  # hangs well past its 1 s timeout
+    started = time.monotonic()
+    with pytest.raises(LLMError):
+        LLMClient(provider, "m", timeout=1, retries=0).complete(purpose="t", system="s", user="u")
+    assert time.monotonic() - started < 1 + HARD_CAP_GRACE_SECONDS + 0.5
+
+
+def test_a_hung_call_never_overruns_the_request_deadline():
+    provider = Recorder(["late", "late"], delay=5.0)
+    started = time.monotonic()
+    with pytest.raises(Exception):
+        LLMClient(provider, "m", timeout=12, retries=1).complete(
+            purpose="t", system="s", user="u", deadline=time.monotonic() + 2.5
+        )
+    assert time.monotonic() - started < 2.5 + HARD_CAP_GRACE_SECONDS + 0.5
 
 
 def test_attempt_gets_only_the_time_left():

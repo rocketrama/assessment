@@ -23,9 +23,25 @@ from app.data.holidays import CalendarHolidays
 from app.data.sessions import delete_proposal, get_proposal, recent_messages
 from app.llm.client import CorpusSegment, LLMClient
 from app.orchestration.composer import build_corpus_input, compose
-from app.orchestration.dates import DateError, find_date_phrases, find_date_range, resolve_range, resolve_reference_date
+from app.orchestration import tool_answers
+from app.orchestration.dates import (
+    DateError,
+    find_date_phrases,
+    find_date_range,
+    find_month_period,
+    resolve_range,
+    resolve_reference_date,
+)
+from app.orchestration.future_balance import (
+    ACCRUAL_QUERY,
+    asks_future_balance,
+    calendar_note,
+    credit_day,
+    find_target_date,
+)
 from app.orchestration.planner import Plan, PlannedRead, plan_message
 from app.orchestration.proposals import (
+    ASK_CHANGE,
     NOTHING_PENDING,
     UNCLEAR_CONFIRMATION,
     WriteOutcome,
@@ -34,7 +50,15 @@ from app.orchestration.proposals import (
     looks_like_confirmation,
     propose,
 )
-from app.orchestration.validator import build_citations, finalize, grounded_chunk_ids, route_for
+from app.orchestration.validator import (
+    build_citations,
+    finalize,
+    grounded_chunk_ids,
+    route_for,
+    strip_internal_ids,
+    superseded_values,
+)
+from app.retrieval.precedence import HIGH_AUTHORITY
 from app.retrieval.retriever import Retriever
 from app.tokens import count_tokens
 from app.tools import authz
@@ -71,6 +95,11 @@ NO_ANSWER = (
     "Please contact the HR team."
 )
 UNAVAILABLE = "Sorry, I couldn't process that just now. Please try again in a moment."
+REWRITE_NOTE = (
+    "Your previous answer was rejected: it states values from superseded or lower-precedence sources "
+    "({values}). Rewrite it with the current values only. Keep an older value only if the employee asked how "
+    "the rule changed or what an older version said. Previous answer: {answer}"
+)
 GREETING = f"Hello! {CAN_HELP}"
 _DATE_REASONS = {
     "past": "that date has already passed",
@@ -109,6 +138,14 @@ class _Stop(Exception):
         self.answer = answer
 
 
+def _nothing_to_book(plan: Plan, message: str) -> bool:
+    """A leave_change plan without a leave type, dates or request id, for a message that
+    names no date either: there is nothing to propose yet."""
+    change = plan.change
+    given = change is not None and any((change.leave_type, change.start, change.end, change.request_id))
+    return not given and not find_date_phrases(message)
+
+
 def _hidden_names(turn: Turn) -> list[str]:
     """Full names the requester may not see; scrubbed from the answer (§7.4)."""
     rows = turn.conn.execute("SELECT employee_id, full_name FROM employees").fetchall()
@@ -118,7 +155,7 @@ def _hidden_names(turn: Turn) -> list[str]:
 def _resolve_employee(turn: Turn, ref: str | None) -> str:
     """Planner's employee reference → an employee id the requester may see, or _Stop.
     Not visible and not existing give the same fixed refusal (§7.3)."""
-    text = (ref or "self").strip()
+    text = re.sub(r"['’]s$", "", (ref or "self").strip()).strip()  # "Test Employee Us's" → the name
     if text.casefold() in _SELF_WORDS or text.upper() == turn.requester.employee_id:
         return turn.requester.employee_id
     if _EMPLOYEE_ID_RE.match(text):
@@ -136,13 +173,26 @@ def _resolve_employee(turn: Turn, ref: str | None) -> str:
     return target
 
 
+def _ensure_future_balance(plan: Plan, turn: Turn) -> None:
+    """A future-balance question needs the current balance and the accrual rules, whatever the planner chose."""
+    if plan.intent not in ("policy_question", "leave_info") or not asks_future_balance(turn.message, turn.today):
+        return
+    if not any(r.tool == "get_leave_balance" for r in plan.reads):
+        plan.reads.append(PlannedRead(tool="get_leave_balance", employee="self"))
+    plan.intent = "policy_question"
+    plan.policy_query = f"{plan.policy_query or turn.message} {ACCRUAL_QUERY}"
+
+
 def _tool_args(turn: Turn, read: PlannedRead) -> dict[str, Any]:
     if read.tool == "get_team_leave":
         if not authz.can_view_team(turn.requester):
             raise _Stop("refuse", NOT_A_MANAGER)
-        start, end = find_date_range(turn.message) or (read.start, read.end)  # the message wins
+        written = find_date_range(turn.message)
+        found = find_date_phrases(turn.message)
+        if not written and not found and (month := find_month_period(turn.message, turn.today)):
+            return {"start_date": month.start.isoformat(), "end_date": month.end.isoformat()}
+        start, end = written or (read.start, read.end)  # the message wins
         if not start:  # the planner dropped dates the user gave: take them from the message
-            found = find_date_phrases(turn.message)
             start, end = (found[0], found[1] if len(found) > 1 else None) if found else (None, None)
         if not start:
             raise _Stop("clarify", "Which dates should I check your team's leave for?")
@@ -159,10 +209,26 @@ def _tool_args(turn: Turn, read: PlannedRead) -> dict[str, Any]:
     return args
 
 
+def _named_employee_ids(turn: Turn) -> set[str]:
+    """Ids of employees whose full name is written in the message. Longest names first,
+    so "Test Employee In Two" is not also read as "Test Employee In"."""
+    text = turn.message.casefold()
+    found: set[str] = set()
+    rows = turn.conn.execute("SELECT employee_id, full_name FROM employees").fetchall()
+    for row in sorted(rows, key=lambda r: len(r["full_name"]), reverse=True):
+        pattern = rf"\b{re.escape(row['full_name'].casefold())}\b"
+        if re.search(pattern, text):
+            found.add(row["employee_id"])
+            text = re.sub(pattern, " ", text)
+    return found
+
+
 def _pin_mentioned_ids(plan: Plan, turn: Turn) -> None:
-    """An employee id written in the message beats the planner's "self": the live
-    model once read "What is E1003's balance?" as the requester's own balance."""
-    mentioned = {m.upper() for m in _EMPLOYEE_ID_IN_TEXT_RE.findall(turn.message)} - {turn.requester.employee_id}
+    """An employee id or full name written in the message beats the planner's "self":
+    the live model once read "What is E1003's balance?" as the requester's own balance,
+    and later "What is Test Employee Us's leave balance?" too."""
+    written_ids = {m.upper() for m in _EMPLOYEE_ID_IN_TEXT_RE.findall(turn.message)}
+    mentioned = (written_ids | _named_employee_ids(turn)) - {turn.requester.employee_id}
     if len(mentioned) != 1:
         return  # none: nothing to pin; several: the bulk check below decides
     target = mentioned.pop()
@@ -226,9 +292,15 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
         if looks_like_confirmation(turn.message):
             return written(execute(ctx, turn.session_id))
         return stop("clarify", UNCLEAR_CONFIRMATION)  # the proposal stays
+    if plan.intent == "leave_change" and plan.policy_query and _nothing_to_book(plan, turn.message):
+        # Eval finding: "My grandmother passed away, how long can I stay home?" was planned
+        # as leave_change in 6 of 11 replies, with a fitting policy_query and nothing to book.
+        # A booking needs details; a question needs an answer, so answer it.
+        log.info("planner intent corrected", extra={"request_id": request_id, "reason": "question, not a booking"})
+        plan = plan.model_copy(update={"intent": "policy_question", "change": None, "missing": []})
     if plan.intent in ("leave_change", "modify"):
         if plan.change is None:
-            return stop("clarify", "Would you like to apply for leave or cancel a request, and for which dates?")
+            return stop("clarify", ASK_CHANGE)
         previous = proposal if plan.intent == "modify" else None
         return written(propose(plan.change, ctx, turn.session_id, turn.today, previous, turn.message))
     if proposal is not None:
@@ -237,6 +309,7 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
     try:
         _pin_mentioned_ids(plan, turn)
         _guard(plan, turn)
+        _ensure_future_balance(plan, turn)
         planned_calls = [(read.tool, _tool_args(turn, read)) for read in plan.reads]
     except _Stop as s:
         return stop(s.route, s.answer)
@@ -251,9 +324,14 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
         tool_calls.append(ToolCall(name=name, args=args, status=result.status))
         tool_results.append({"tool": name, "args": args, "status": result.status, "data": result.data, "error": result.reason})
 
+    wants_docs = plan.intent == "policy_question" or bool(plan.policy_query)
+    if not wants_docs and tool_answers.can_render(tool_results):
+        # Records only: code writes the answer, every record, no LLM call.
+        answer = tool_answers.render(tool_results, turn.requester.employee_id)
+        return TurnResult(finalize(request_id, answer, "tool", (), tool_calls, hidden_names=hidden))
+
     # Documents.
     retrieval, segments, sent_ids, reference = None, [], [], turn.today
-    wants_docs = plan.intent == "policy_question" or bool(plan.policy_query)
     if wants_docs and turn.retriever is not None:
         reference = resolve_reference_date(plan.about_date, turn.today) or turn.today
         retrieval = turn.retriever.retrieve(plan.policy_query or turn.message, turn.requester, reference, today=turn.today)
@@ -264,14 +342,50 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
         log.info("no_answer", extra={"reason": "nothing retrieved or looked up"})
         return stop("no_answer", NO_ANSWER)
 
-    composed = compose(
-        turn.llm, turn.message, turn.requester, turn.today, reference, segments, tool_results, [], turn.deadline
-    )
+    notes: list[str] = []
+    has_balance = any(c.name == "get_leave_balance" and c.status == "success" for c in tool_calls)
+    if wants_docs and has_balance and (target := find_target_date(turn.message, turn.today)):
+        eligible_facts = [f for r in retrieval.resolutions for f in r.winners] if retrieval else []
+        notes.append(calendar_note(turn.today, target, turn.requester.join_date, credit_day(eligible_facts)))
+
+    def write(extra_notes: list[str]):
+        return compose(
+            turn.llm, turn.message, turn.requester, turn.today, reference, segments, tool_results,
+            notes + extra_notes, turn.deadline,
+        )
+
+    composed = write([])
     corpus_tokens = sum(count_tokens(s.text) for s in segments) if composed is not None else 0
     if composed is None or (not composed.answer.strip() and composed.covered != "none"):
         return stop("no_answer", UNAVAILABLE)  # never send an empty answer
-    used = grounded_chunk_ids(composed.used_chunk_ids, composed.answer, retrieval.resolutions if retrieval else ())
-    citations: list[Citation] = build_citations(used, sent_ids, turn.retriever.corpus) if turn.retriever else []
+    # Answer check: superseded values go back to the composer once, with the exact values
+    # found; without time for that (or a usable rewrite), the first answer stands.
+    superseded = superseded_values(composed.answer, retrieval.resolutions) if retrieval else []
+    if superseded and composed.covered != "none":
+        log.info("answer_check", extra={"reason": "superseded values", "values": superseded})
+        retry = write([REWRITE_NOTE.format(values="; ".join(superseded), answer=composed.answer)])
+        if retry is not None and retry.answer.strip() and retry.covered != "none":
+            composed = retry
+    if turn.retriever is not None:
+        composed = composed.model_copy(
+            update={"answer": strip_internal_ids(composed.answer, turn.retriever.corpus.docs)}
+        )
+    low_authority: dict[str, list[str]] = {}
+    if turn.retriever is not None:
+        corpus = turn.retriever.corpus
+        low_authority = {
+            c: [f.value for f in corpus.facts_by_chunk.get(c, [])]
+            for c in sent_ids
+            if c in corpus.chunks and corpus.docs[corpus.chunks[c].doc_id].doc_type not in HIGH_AUTHORITY
+        }
+    used = grounded_chunk_ids(
+        composed.used_chunk_ids, composed.answer, retrieval.resolutions if retrieval else (), low_authority
+    )
+    # Rule-table rows are sent as facts, not passages: their chunks count as sent.
+    rule_chunks = [f.chunk_id for r in retrieval.resolutions for f in r.winners + r.upcoming] if retrieval else []
+    citations: list[Citation] = (
+        build_citations(used, list(sent_ids) + rule_chunks, turn.retriever.corpus) if turn.retriever else []
+    )
     if wants_docs and not citations and not tool_calls:
         # A policy answer with no supported citation is a guess: don't send it (§8.1).
         log.info(

@@ -4,12 +4,14 @@ Chunks arrive in priority order (winning passages, conflicting ones, upcoming
 ones, then other relevant context) and are added while they fit in
 CORPUS_TOKEN_LIMIT cl100k tokens. A chunk that doesn't fit is skipped and the
 next, smaller one is still tried. llm/client.py recounts and refuses anything
-over the limit, so the budget is enforced twice.
+over the limit, so the budget is enforced twice. A chunk flagged by the injection
+scan is sent without its instruction-like sentences.
 """
 
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
+from app.ingestion.injection_scan import without_injected_sentences
 from app.llm.client import CORPUS_TOKEN_LIMIT, CorpusSegment
 from app.retrieval.corpus import ChunkRecord
 from app.tokens import count_tokens
@@ -39,7 +41,8 @@ def pack_context(
         if chunk_id in seen:
             continue
         seen.add(chunk_id)
-        text = chunks[chunk_id].text
+        chunk = chunks[chunk_id]
+        text = without_injected_sentences(chunk.text) if chunk.suspicious else chunk.text
         tokens = count_tokens(text)  # recount: what is sent is what is counted
         if used + tokens > budget:
             omitted.append(chunk_id)

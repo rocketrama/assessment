@@ -180,6 +180,28 @@ def test_own_balance_is_a_tool_answer(client, script):
     body = ask(client, script, "What's my balance?", plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
     assert body["route"] == "tool"
     assert body["tool_calls"] == [{"name": "get_leave_balance", "args": {"employee_id": "E1001"}, "status": "success"}]
+    assert body["answer"] == "Your leave balances: annual 12 days, sick 6 days."
+    assert script.composer_prompts == []  # records only: written in code
+
+
+def test_future_balance_gets_the_calendar_in_code(client, script):
+    ask(client, script, "How many annual days will I have by the end of December?",
+        plan(policy_query="annual leave accrual", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
+    assert "4 (2026-09-30, 2026-10-31, 2026-11-30, 2026-12-31) month-end dates" in script.composer_prompts[-1]
+
+
+def test_future_balance_looks_up_the_balance_when_the_planner_forgets(client, script):
+    """Live finding: the planner sometimes returned only a carry-forward query, no balance read."""
+    body = ask(client, script, "How many annual leave days will I have by the end of December?",
+               plan(policy_query="annual leave carry forward"))
+    assert body["tool_calls"][0] == {"name": "get_leave_balance", "args": {"employee_id": "E1001"}, "status": "success"}
+    assert "Future-balance calendar" in script.composer_prompts[-1]
+
+
+def test_no_calendar_without_a_future_date(client, script):
+    ask(client, script, "Sick days left and the rule?",
+        plan(policy_query="sick leave", reads=[{"tool": "get_leave_balance", "employee": "self", "leave_type": "sick"}]))
+    assert "Future-balance calendar" not in script.composer_prompts[-1]
 
 
 def test_policy_plus_tools_is_hybrid(client, script):
@@ -212,6 +234,34 @@ def test_team_leave_next_week_for_a_manager(client, script):
                plan("leave_info", reads=[{"tool": "get_team_leave", "start": "next week"}]), employee="M2001")
     assert body["route"] == "tool"
     assert body["tool_calls"][0]["args"] == {"start_date": "2026-09-21", "end_date": "2026-09-25"}
+
+
+def test_team_leave_next_month_is_the_whole_month(client, script):
+    """Live finding: "next month" was answered with "Which dates should I check?"."""
+    body = ask(client, script, "Is anyone in my team off next month?",
+               plan("leave_info", reads=[{"tool": "get_team_leave", "start": "next month"}]), employee="M2001")
+    assert body["route"] == "tool"
+    assert body["tool_calls"][0]["args"] == {"start_date": "2026-10-01", "end_date": "2026-10-31"}
+
+
+@pytest.mark.parametrize("planned", ["self", "Test Employee Us's"])
+def test_a_name_in_the_message_beats_self(client, script, planned):
+    """Live finding: "What is Test Employee Us's leave balance?" returned the manager's own balance."""
+    body = ask(client, script, "What is Test Employee Us's leave balance?",
+               plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": planned}]), employee="M2001")
+    assert body["route"] == "tool" and body["tool_calls"][0]["args"] == {"employee_id": "E1002"}
+
+
+def test_a_name_the_requester_may_not_see_is_refused_not_swapped_for_self(client, script):
+    body = ask(client, script, "What is Test Employee De's leave balance?",
+               plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
+    assert body["route"] == "refuse" and body["answer"] == ACCESS_DENIED_MESSAGE
+
+
+def test_own_full_name_is_still_self(client, script):
+    body = ask(client, script, "What is Test Employee In's balance?",
+               plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
+    assert body["tool_calls"][0]["args"] == {"employee_id": "E1001"}
 
 
 def test_team_leave_refused_for_non_managers(client, script):
@@ -310,7 +360,8 @@ def test_own_id_in_the_message_is_still_self(client, script):
 
 def test_empty_composer_answer_is_never_sent(client, script):
     script.compose = lambda ids, user: {"answer": "  ", "used_chunk_ids": [], "covered": "full"}
-    body = ask(client, script, "What's my balance?", plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
+    body = ask(client, script, "My balance and the rules?",
+               plan(policy_query="annual leave", reads=[{"tool": "get_leave_balance", "employee": "self"}]))
     assert body["route"] == "no_answer" and body["answer"].strip()
 
 
@@ -326,3 +377,23 @@ def test_spurious_missing_items_do_not_block_a_lookup(client, script):
     body = ask(client, script, "What's my balance?",
                plan("leave_info", reads=[{"tool": "get_leave_balance", "employee": "self"}], missing=["leave type"]))
     assert body["route"] == "tool"
+
+
+def test_superseded_value_in_the_answer_is_rewritten_once(client, script):
+    """Layer 3: the answer names v1's / the FAQ's outdated 10 days; the composer is sent back
+    once with exactly that value, and the rewrite is what the employee gets."""
+    replies = iter([
+        "You get 12 days of sick leave (POL-V2::000). Older sources said 10 days.",
+        "You get 12 days of sick leave.",
+    ])
+    script.compose = lambda ids, user: {"answer": next(replies), "used_chunk_ids": ids, "covered": "full"}
+    body = ask(client, script, "How many sick days do I get?", plan(policy_query="sick leave days per year"))
+    assert len(script.composer_prompts) == 2
+    assert "Your previous answer was rejected" in script.composer_prompts[1] and "(10 days)" in script.composer_prompts[1]
+    assert body["answer"] == "You get 12 days of sick leave." and body["route"] == "rag"
+
+
+def test_internal_ids_never_reach_the_employee_even_without_a_retry(client, script):
+    script.compose = lambda ids, user: {"answer": "You get 12 days (POL‑V2::000).", "used_chunk_ids": ids, "covered": "full"}
+    body = ask(client, script, "How many sick days do I get?", plan(policy_query="sick leave days per year"))
+    assert body["answer"] == "You get 12 days." and len(script.composer_prompts) == 1

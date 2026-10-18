@@ -45,6 +45,23 @@ def _clean(phrase: str) -> str:
     return " ".join(text.split())
 
 
+_WEEKDAY_YEAR_RE = re.compile(r"((?:(?:next|this) )?(?:" + "|".join(_WEEKDAYS) + r")) (\d{4})")
+
+
+def _split_weekday_year(text: str) -> tuple[str, int | None]:
+    """'friday 2026' → ('friday', 2026). Eval finding: the planner added the year to
+    "until Friday". The year then only has to agree with the weekday's date."""
+    if m := _WEEKDAY_YEAR_RE.fullmatch(text):
+        return m[1], int(m[2])
+    return text, None
+
+
+def _check_year(result: date, year: int | None, phrase: str) -> date:
+    if year is not None and result.year != year:
+        raise DateError(phrase, "not_understood")
+    return result
+
+
 def _next_weekday(today: date, weekday: int) -> date:
     days = (weekday - today.weekday()) % 7 or 7
     return today + timedelta(days=days)
@@ -74,7 +91,7 @@ def _explicit(text: str) -> date | None:
 
 
 def resolve_date(phrase: str, today: date, allow_past: bool = True) -> date:
-    text = _clean(phrase)
+    text, year = _split_weekday_year(_clean(phrase))
     if not text:
         raise DateError(phrase, "not_understood")
     if text == "today":
@@ -85,7 +102,7 @@ def resolve_date(phrase: str, today: date, allow_past: bool = True) -> date:
         weekday = _WEEKDAYS.index(m[2])
         if m[1] != "next" and weekday == today.weekday():
             raise DateError(phrase, "ambiguous")  # "Tuesday" said on a Tuesday
-        result = _next_weekday(today, weekday)
+        result = _check_year(_next_weekday(today, weekday), year, phrase)
     else:
         try:
             result = _explicit(text)
@@ -129,8 +146,9 @@ def resolve_end(phrase: str, start: date, today: date) -> date:
     """End of a leave range. A bare weekday ("until Friday") means the first such
     day on or after the start — for leave starting Monday 21 September, "Friday"
     is the 25th, not the Friday before it. Other phrases resolve as usual."""
-    if m := re.fullmatch(r"(?:this )?(" + "|".join(_WEEKDAYS) + r")", _clean(phrase)):
-        return start + timedelta(days=(_WEEKDAYS.index(m[1]) - start.weekday()) % 7)
+    text, year = _split_weekday_year(_clean(phrase))
+    if m := re.fullmatch(r"(?:this )?(" + "|".join(_WEEKDAYS) + r")", text):
+        return _check_year(start + timedelta(days=(_WEEKDAYS.index(m[1]) - start.weekday()) % 7), year, phrase)
     return resolve_date(phrase, today)
 
 
@@ -189,3 +207,26 @@ def find_date_range(message: str) -> tuple[str, str] | None:
     The message is the ground truth: this beats the planner's copy of it."""
     m = _RANGE_RE.search(message)
     return (m.group(1), m.group(2)) if m else None
+
+
+# A month name alone needs "in" / "during" / … before it ("may" is also a verb).
+_MONTH_PERIOD_RE = re.compile(
+    rf"\b(?:(next|this) month|(?:in|during|for|throughout) ({_MONTH})\b(?:,? (\d{{4}}))?)", re.IGNORECASE
+)
+
+
+def find_month_period(message: str, today: date) -> DateRange | None:
+    """A whole month named in the message: "next month", "this month", "in October
+    [2026]" → its first to last day; a month without a year is in 2026. For team
+    leave lookups only: a leave request for "next month" still needs exact dates.
+    Live finding: "Is anyone in my team off next month?" was answered with a question."""
+    m = _MONTH_PERIOD_RE.search(message)
+    if not m:
+        return None
+    if m[1]:
+        year, month = today.year, today.month
+        if m[1].lower() == "next":
+            year, month = (year + 1, 1) if month == 12 else (year, month + 1)
+    else:
+        year, month = int(m[3] or DEFAULT_YEAR), _MONTHS[m[2].lower()]
+    return DateRange(date(year, month, 1), date(year, month, calendar.monthrange(year, month)[1]))

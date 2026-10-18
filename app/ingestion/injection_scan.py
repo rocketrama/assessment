@@ -1,9 +1,10 @@
 """Flags corpus text that reads like instructions to an AI system (TASK.pdf §2.1, §7.5).
 
-A flag never removes text: a flagged chunk stays retrievable as information. The
-defence is structural (the planner never sees corpus text, the composer wraps
-it as untrusted data, tools only run from the user's plan); this flag adds a
-signal for the composer, the logs and the eval.
+A flag never removes a chunk: a flagged chunk stays retrievable as information.
+The defence is structural (the planner never sees corpus text, the composer wraps
+it as untrusted data, tools only run from the user's plan). On top of that, the
+instruction-like sentences of a flagged chunk are left out of what the answer
+call is sent (without_injected_sentences), and the flag feeds the logs and eval.
 """
 
 import re
@@ -25,3 +26,25 @@ _INJECTION_RE = re.compile("|".join(f"(?:{p})" for p in _PATTERNS), re.IGNORECAS
 
 def looks_like_injection(text: str) -> bool:
     return _INJECTION_RE.search(text) is not None
+
+
+_SENTENCE_END_RE = re.compile(r"(?<=[.!?])\s+")
+
+
+def without_injected_sentences(text: str) -> str:
+    """The text with every sentence that reads like an instruction to an AI left out.
+
+    Used on flagged chunks before they reach the answer call. Eval finding: told to
+    ignore such text, the model still answered "Your line manager's salary band ...
+    is not provided here as per policy" — it obeyed, but the planted request had
+    reached the employee. A sentence like that carries no HR information, so
+    leaving it out loses nothing; the rest of the chunk is sent as before."""
+    lines = []
+    for line in text.split("\n"):  # lines kept as they are: chunks hold tables and lists
+        if not looks_like_injection(line):
+            lines.append(line)
+            continue
+        kept = " ".join(s for s in _SENTENCE_END_RE.split(line) if not looks_like_injection(s))
+        if kept.strip():
+            lines.append(kept)
+    return "\n".join(lines)
