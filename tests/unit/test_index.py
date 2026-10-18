@@ -66,6 +66,39 @@ def test_tokenize_drops_stopwords_and_keeps_codes():
     assert tokenize("How many days for L5 in the U.S.?") == ["many", "days", "l5", "u.s"]
 
 
+def test_faiss_dense_ranking_matches_exact_dot_product():
+    """FAISS IndexFlatIP is exact: same ranks as a plain numpy dot product over the allowed rows."""
+    rng = np.random.default_rng(0)
+    vectors = rng.standard_normal((145, 384)).astype(np.float32)
+    vectors /= np.linalg.norm(vectors, axis=1, keepdims=True)
+    query = vectors[7] + 0.1 * rng.standard_normal(384).astype(np.float32)
+    query /= np.linalg.norm(query)
+    ids = [f"DOC::{i:03d}" for i in range(145)]
+
+    class FixedQuery(HashingEmbedder):
+        def embed_query(self, text):
+            return query
+
+    index = SearchIndex(ids, ["x"] * 145, vectors, FixedQuery())
+    rows = np.array(sorted(rng.choice(145, 90, replace=False)), dtype=np.int64)  # the allowed set
+
+    faiss_scores = index._dense_scores("q", rows)
+    numpy_scores = vectors[rows] @ query
+    assert np.allclose(faiss_scores, numpy_scores, atol=1e-6)
+    assert list(np.argsort(-faiss_scores)[:10]) == list(np.argsort(-numpy_scores)[:10])
+
+
+def test_dense_search_never_scores_a_restricted_nearest_neighbour():
+    """The closest vector overall is restricted: it must not appear, and every allowed chunk still ranks."""
+    embedder = HashingEmbedder()
+    texts = ["sick leave days", "carry forward annual leave", "public holidays"]
+    vectors = embedder.embed(texts)
+    index = SearchIndex(["HR::000", "POL::000", "CAL::000"], texts, vectors, embedder)
+    hits = index.search("sick leave days", {"POL::000", "CAL::000"}, k=10)
+    assert {h.chunk_id for h in hits} == {"POL::000", "CAL::000"}
+    assert sorted(h.dense_rank for h in hits) == [1, 2]
+
+
 def test_misaligned_inputs_rejected():
     import pytest
 

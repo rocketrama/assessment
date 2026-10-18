@@ -8,6 +8,7 @@ openai==3.31.0
 anthropic==1.15.0
 tiktoken==0.14.0
 fastembed==0.9.0
+faiss-cpu==1.15.1
 # Ingestion: parsing and OCR (step 4a). Tesseract itself comes from apt in the Dockerfile.
 pdfplumber==0.11.10
 pdfminer.six==20260107
