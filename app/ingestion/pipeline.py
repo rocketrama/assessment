@@ -3,7 +3,8 @@
 Runs at startup; `/health` stays 503 until it returns. One bad document is
 logged and skipped instead of failing the whole startup (must-pass #1). Holiday
 rows are extracted from `calendar` documents; policy facts are extracted with
-the LLM and grouped into rule keys; every chunk is embedded locally for search
+the LLM and grouped into rule keys (embeddings, then an LLM check of near
+misses); every chunk is embedded locally for search
 (vectors cached by chunk text).
 
 The whole run is bounded by INGESTION_BUDGET_SECONDS: fact extraction stops
@@ -38,6 +39,7 @@ from app.ingestion.injection_scan import looks_like_injection
 from app.ingestion.loaders import load_document
 from app.ingestion.loaders.ocr import PageOcr, tesseract_available
 from app.ingestion.manifest import ManifestEntry, ManifestError, load_manifest
+from app.ingestion.rule_judge import JudgeStats, judge_pairs
 from app.ingestion.rule_keys import DEFAULT_THRESHOLD, assign_rule_keys
 from app.llm.client import LLMClient
 from app.llm.embeddings import Embedder
@@ -68,6 +70,7 @@ class IngestionReport:
     low_confidence_chunks: list[str] = field(default_factory=list)
     holidays: Counter = field(default_factory=Counter)  # doc_id → office-closed days
     facts: FactStats | None = None  # None when no LLM is configured
+    rule_judge: JudgeStats | None = None  # None when no LLM is configured
     rule_keys: int = 0
     multi_doc_rules: int = 0  # rule keys stated by more than one document
     seconds: float = 0.0
@@ -158,7 +161,19 @@ def run_ingestion(
                 fact_chunks, llm, cache, concurrency=settings.llm_max_concurrency, deadline=deadline
             )
             threshold = settings.rule_cluster_threshold or DEFAULT_THRESHOLD
-            facts = assign_rule_keys(facts, embedder.embed, threshold)
+            report.rule_judge = JudgeStats()
+
+            def judge(questions):
+                return judge_pairs(
+                    questions,
+                    llm,
+                    cache,
+                    concurrency=settings.llm_max_concurrency,
+                    deadline=deadline,
+                    stats=report.rule_judge,
+                )
+
+            facts = assign_rule_keys(facts, embedder.embed, threshold, judge=judge)
         else:
             report.warnings.append("no LLM configured: policy facts not extracted")
 
@@ -225,6 +240,12 @@ def _log_report(report: IngestionReport) -> None:
             "fact_failed_chunks": len(report.facts.failed_chunks) if report.facts else 0,
             "fact_deadline_skipped": len(report.facts.deadline_skipped) if report.facts else 0,
             "fact_seconds": report.facts.seconds if report.facts else 0,
+            "rule_judge_questions": report.rule_judge.questions if report.rule_judge else 0,
+            "rule_judge_same": report.rule_judge.same if report.rule_judge else 0,
+            "rule_judge_llm_calls": report.rule_judge.llm_calls if report.rule_judge else 0,
+            "rule_judge_cache_hits": report.rule_judge.cache_hits if report.rule_judge else 0,
+            "rule_judge_unanswered": report.rule_judge.unanswered if report.rule_judge else 0,
+            "rule_judge_seconds": report.rule_judge.seconds if report.rule_judge else 0,
             "rule_keys": report.rule_keys,
             "multi_doc_rules": report.multi_doc_rules,
             "seconds": report.seconds,

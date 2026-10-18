@@ -3,7 +3,7 @@
 import numpy as np
 
 from app.ingestion.extract_facts import Fact
-from app.ingestion.rule_keys import assign_rule_keys, normalize_conditions
+from app.ingestion.rule_keys import assign_rule_keys, normalize_attribute, normalize_conditions
 
 # Hand-made embedding space: near-synonyms get near-identical vectors.
 _VECTORS = {
@@ -104,7 +104,9 @@ import pytest  # noqa: E402
 
 
 @pytest.mark.parametrize(
-    "conditions", ["Employees in India", "employees in Germany", "Staff based in the Berlin office", "for employees of Veltrix Systems Inc."]
+    "conditions",
+    ["Employees in India", "employees in Germany", "Staff based in the Berlin office", "for employees of Veltrix Systems Inc.",
+     "Bengaluru and Austin offices", "employees in the Berlin and Munich offices", "the London office"],
 )
 def test_where_only_conditions_are_no_condition(conditions):
     """Eval finding: the model writes the region into conditions despite the prompt,
@@ -113,7 +115,10 @@ def test_where_only_conditions_are_no_condition(conditions):
 
 
 @pytest.mark.parametrize(
-    "conditions", ["levels L1-L3", "employees with 5 or more years of service", "primary caregiver", "employees in India after probation"]
+    "conditions",
+    ["levels L1-L3", "employees with 5 or more years of service", "primary caregiver", "employees in India after probation",
+     # one row per office in a single table: different values, so different rules
+     "Bengaluru, India", "home office", "remote offices"],
 )
 def test_real_conditions_are_kept(conditions):
     assert normalize_conditions(conditions) != ""
@@ -174,6 +179,56 @@ def test_same_document_different_keys_never_merge():
     assert k["FAQ::004#f00"] == k["V2::008#f00"] != k["FAQ::004#f01"] == k["V2::008#f01"]
 
 
+def test_recommendation_never_merges_with_entitlement():
+    """Eval finding: "encouraged to take at least ten days" shared a key with
+    Germany's 30-day entitlement and was answered as India's entitlement."""
+    global _VECTORS
+    _VECTORS = {
+        **_VECTORS,
+        "annual leave: days per year": [0.5, 0.5, 0.7],
+        "annual leave: recommended minimum days to take": [0.5, 0.5, 0.71],
+        "annual leave: encouraged minimum days to take": [0.5, 0.5, 0.72],
+    }
+    k = keys(
+        [
+            F("DE::001#f00", "annual leave", "days per year", "30", doc="DE"),
+            F("V1::005#f00", "annual leave", "encouraged minimum days to take", "ten working days", doc="V1"),
+            F("V2::005#f00", "annual leave", "recommended minimum days to take", "ten working days", doc="V2"),
+        ]
+    )
+    assert k["V1::005#f00"] == k["V2::005#f00"] != k["DE::001#f00"]
+
+
+@pytest.mark.parametrize(
+    "attribute, expected",
+    [
+        ("expiry", "deadline to use"),
+        ("Expiration date", "deadline to use"),
+        ("carry forward expiry", "carry forward deadline to use"),
+        ("lapse", "deadline to use"),
+        ("valid until", "deadline to use"),
+        ("use-by date", "deadline to use"),
+        ("deadline to use", "deadline to use"),
+        ("days per year", "days per year"),  # unrelated attributes untouched
+        ("forfeiture date for unused days", "forfeiture date for unused days"),  # a different rule
+    ],
+)
+def test_validity_wording_is_normalised(attribute, expected):
+    assert normalize_attribute(attribute) == expected
+
+
+def test_negative_rule_worded_as_expiry_meets_the_deadline_it_denies():
+    """B1 finding: India's "do not expire on a fixed date" was keyed "expiry", the global
+    "31 March" "deadline to use"; precedence never compared them and India got "31 March"."""
+    k = keys(
+        [
+            F("V2::004#f00", "carry forward", "deadline to use", "31 March", doc="V2"),
+            F("IN::002#f00", "carry forward", "expiry", "do not expire on a fixed date", doc="IN"),
+        ]
+    )
+    assert k["V2::004#f00"] == k["IN::002#f00"]
+
+
 def test_cannot_link_survives_merges():
     from app.ingestion.rule_keys import average_linkage_labels
 
@@ -184,3 +239,89 @@ def test_cannot_link_survives_merges():
     # 1 and 2 are closest and merge first; 0 is then barred from that cluster
     # because it contains 2, however close 0 is to 1.
     assert labels[1] == labels[2] != labels[0]
+
+
+# --- LLM judge for near misses ----------------------------------------------
+
+def _at_distance(d, axis=2):
+    """A unit vector at cosine distance `d` from [1, 0, 0], leaning towards `axis`."""
+    v = [1 - d, 0.0, 0.0]
+    v[axis] = float(np.sqrt(1 - (1 - d) ** 2))
+    return v
+
+
+# Eval finding: the WFH memo, the policy and the FAQ named one rule three ways.
+_VECTORS["remote work days: maximum days per week"] = [1.0, 0.0, 0.0]
+_VECTORS["hybrid work: days per week"] = _at_distance(0.18)
+_VECTORS["home office days: maximum days per week"] = _at_distance(0.20, axis=1)
+_VECTORS["learning days: days per year"] = _at_distance(0.30)
+
+
+class FakeJudge:
+    """Says "same" for pairs whose sides share a topic word listed in `same_topics`."""
+
+    def __init__(self, same_topics=(), answer=True):
+        self.same_topics, self.answer = set(same_topics), answer
+        self.asked: list[tuple[set[str], set[str]]] = []
+
+    def __call__(self, questions):
+        out = []
+        for a, b in questions:
+            topics_a, topics_b = {f.topic for f in a}, {f.topic for f in b}
+            self.asked.append((topics_a, topics_b))
+            out.append(self.answer if self.answer is None else bool((topics_a | topics_b) <= self.same_topics))
+        return out
+
+
+def judged_keys(facts, judge):
+    return {f.fact_id: f.rule_key for f in assign_rule_keys(facts, fake_embed, threshold=0.15, judge=judge)}
+
+
+WFH = [
+    F("POL::001#f00", "remote work days", "maximum days per week", "2", "days", doc="POL"),
+    F("MEMO::000#f00", "hybrid work", "days per week", "3", "days", "Bengaluru and Austin offices", doc="MEMO"),
+    F("FAQ::006#f00", "home office days", "maximum days per week", "2", "days", doc="FAQ"),
+]
+
+
+def test_near_misses_merge_when_the_judge_says_same_rule():
+    judge = FakeJudge({"remote work days", "hybrid work", "home office days"})
+    k = judged_keys(WFH, judge)
+    assert len(set(k.values())) == 1
+    assert judge.asked  # the embedder alone kept them apart
+
+
+def test_near_misses_stay_apart_when_the_judge_says_no_or_gives_no_answer():
+    assert len(set(judged_keys(WFH, FakeJudge(answer=False)).values())) == 3
+    assert len(set(judged_keys(WFH, FakeJudge(answer=None)).values())) == 3
+    assert judged_keys(WFH, FakeJudge(answer=None)) == keys(WFH)  # same as no judge at all
+
+
+def test_pairs_outside_the_band_are_never_asked():
+    judge = FakeJudge(answer=True)
+    k = judged_keys([WFH[0], F("LRN::001#f00", "learning days", "days per year", "3", doc="LRN")], judge)
+    assert not judge.asked  # 0.30 apart: beyond NEAR_MISS_MAX
+    assert len(set(k.values())) == 2
+
+
+def test_judge_cannot_override_cannot_link():
+    """Two facts of one document with different keys never merge, whatever the judge says:
+    the memo also states a hybrid rule, and the judge (wrongly) says all three are one rule."""
+    memo_other = F("POL::002#f00", "hybrid work", "days per week", "3", "days", doc="POL")
+    k = judged_keys([WFH[0], memo_other, WFH[2]], FakeJudge(answer=True))
+    assert k["POL::001#f00"] != k["POL::002#f00"]
+
+
+def test_judge_is_not_asked_about_different_numbers():
+    judge = FakeJudge(answer=True)
+    _VECTORS["annual leave accrual: days per month (less than 2 years)"] = [0.0, 1.0, 0.1]
+    _VECTORS["annual leave: days per month (5 years or more)"] = [0.0, 0.85, 0.5]
+    k = judged_keys(
+        [
+            F("A::001#f00", "annual leave accrual", "days per month", "1.5", None, "less than 2 years", doc="A"),
+            F("B::001#f00", "annual leave", "days per month", "2", None, "5 years or more", doc="B"),
+        ],
+        judge,
+    )
+    assert not judge.asked
+    assert len(set(k.values())) == 2

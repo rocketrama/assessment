@@ -16,10 +16,26 @@ cannot-link constraints, deterministic and untuned:
 - different numbers in the keys: tiers and levels ("less than 2 years" vs
   "2 to less than 5 years", "L1-L3" vs "L4-L5") are only ~0.09 apart as
   embeddings, but their numbers differ, so they are different rules.
+- recommendation vs rule: "annual leave: encouraged minimum days" and
+  "annual leave: days per year" embed closely, but a recommendation is not an
+  entitlement; merged, the recommended ten days outranked Germany's 30 and was
+  answered as India's entitlement (eval finding).
+Validity wording in the attribute ("expiry", "lapse", "valid until") is normalised to
+"deadline to use" before embedding, so a rule stated in the negative meets the rule it
+denies (`normalize_attribute`).
 Units are not part of the key (the LLM names them inconsistently); values never
 are — the same rule with different values must meet so the conflict surfaces.
 Region, date and document type are left out; precedence handles them.
 Over-merging is worse than under-merging, so the threshold stays tight.
+
+Near misses are judged by the LLM (`judge`, see rule_judge.py). An embedder can't
+tell that "hybrid work", "home office" and "remote work" name one rule while
+"primary caregiver weeks" and "secondary caregiver weeks" don't: the WFH memo sat
+0.136 from the policy it replaces, the caregiver pair closer still. So after
+clustering, cluster pairs whose average distance is above the threshold but within
+NEAR_MISS_MAX — and that no cannot-link forbids — are asked "same rule?" and merged
+on yes, closest first; a merge that would join a cannot-link pair is skipped. No
+answer (no LLM, deadline, failed call) means no merge, the conservative default.
 
 Input is sorted by fact_id, so the result is reproducible.
 """
@@ -28,6 +44,7 @@ import re
 from collections import defaultdict
 from collections.abc import Callable, Sequence
 from dataclasses import replace
+from itertools import combinations
 
 import numpy as np
 
@@ -40,6 +57,17 @@ from app.ingestion.extract_facts import Fact
 # rules. Over-merging is worse than under-merging, so the default is 0.12.
 # RULE_CLUSTER_THRESHOLD overrides it.
 DEFAULT_THRESHOLD = 0.12
+# Upper end of the near-miss band sent to the LLM judge. Measured on the assessment
+# corpus (303 facts, 215 clusters): 149 cluster pairs up to 0.22, 390 up to 0.25, and
+# the pairs between 0.22 and 0.25 were all different rules. The WFH memo joins the
+# policy at 0.136 and the FAQ/wiki cluster joins them at 0.170.
+NEAR_MISS_MAX = 0.22
+# Facts shown per cluster in a judge question: enough to see the rule, few tokens.
+FACTS_PER_SIDE = 3
+
+# (cluster A facts, cluster B facts) pairs → one verdict each: True = same rule,
+# False = different, None = no answer (treated as different).
+Judge = Callable[[list[tuple[list["Fact"], list["Fact"]]]], list[bool | None]]
 
 _NONE_WORDS = {"", "none", "null", "n/a", "na", "all", "all employees", "any", "-"}
 
@@ -62,24 +90,56 @@ _WHERE_ONLY_RE = re.compile(
 )
 
 
+# "bengaluru and austin offices", "the london office": names offices, so where, not who
+# (eval finding: the WFH memo's rule stayed apart from the policy it replaces). One place
+# alone without "office" ("bengaluru, india") is kept: a table with a row per office
+# in one document states a different value per row. Home / remote offices are real conditions.
+_OFFICES_RE = re.compile(
+    rf"^(?:for |applies to )?(?:(?:all )?(?:employees|employee|staff) )?(?:(?:in|at|of|based in|working in|located in) )?"
+    rf"(?:the )?(?!(?:home|remote|virtual)\b){_PLACE}(?:(?:and|or) (?:the )?{_PLACE})*(?:offices?|locations?|sites?)$"
+)
+
+
 def normalize_conditions(conditions: str | None) -> str:
     text = _norm_words(conditions)
-    if text in _NONE_WORDS or _WHERE_ONLY_RE.match(text):
+    if text in _NONE_WORDS or _WHERE_ONLY_RE.match(text) or _OFFICES_RE.match(text):
         return ""
     return text
 
 
+# Validity wording → one attribute, before embedding. The extraction prompt asks for a
+# negative rule to reuse the positive rule's attribute, but the live model doesn't always:
+# a cold Docker rebuild wrote the India addendum's "do not expire on a fixed date" as
+# "expiry" and the global "31 March" as "deadline to use". As embeddings they sat 0.113
+# apart (threshold 0.12) and a closer wrong match won, so precedence never compared them
+# and India was told "31 March" (B1 finding). Normalised, the two are 0.023 apart.
+# General vocabulary, not corpus facts. Forfeiture of unused days stays a separate rule.
+_VALIDITY_RE = re.compile(
+    r"\b(?:expiry|expiration|expires?|lapse|lapses|validity|valid until|use[- ]by|must be used by)"
+    r"(?: (?:date|period|deadline))?\b"
+)
+
+
+def normalize_attribute(attribute: str) -> str:
+    return " ".join(_VALIDITY_RE.sub("deadline to use", attribute.strip().lower()).split())
+
+
 def fact_key_text(fact: Fact) -> str:
-    key = f"{fact.topic.strip().lower()}: {fact.attribute.strip().lower()}"
+    key = f"{fact.topic.strip().lower()}: {normalize_attribute(fact.attribute)}"
     conditions = normalize_conditions(fact.conditions)
     return f"{key} ({conditions})" if conditions else key
 
 
 _KEY_NUMBER_RE = re.compile(r"\d+(?:\.\d+)?")
+_RECOMMENDATION_RE = re.compile(r"\b(?:encouraged|recommended|suggested|advised|should)\b")
 
 
 def key_numbers(key_text: str) -> frozenset[str]:
     return frozenset(_KEY_NUMBER_RE.findall(key_text))
+
+
+def is_recommendation(key_text: str) -> bool:
+    return bool(_RECOMMENDATION_RE.search(key_text))
 
 
 def _slug(text: str) -> str:
@@ -125,10 +185,97 @@ def average_linkage_labels(
     return labels
 
 
+def cannot_link_matrix(facts: Sequence[Fact], keys: Sequence[str]) -> np.ndarray:
+    """True where two facts may never share a rule key (see module docstring)."""
+    docs = np.array([f.doc_id for f in facts])
+    key_arr = np.array(keys)
+    numbers = [key_numbers(k) for k in keys]
+    advisory = np.array([is_recommendation(k) for k in keys])
+    same_doc_other_key = (docs[:, None] == docs[None, :]) & (key_arr[:, None] != key_arr[None, :])
+    different_numbers = np.array([[bool(a and b and a != b) for b in numbers] for a in numbers])
+    different_strength = advisory[:, None] != advisory[None, :]
+    return same_doc_other_key | different_numbers | different_strength
+
+
+def near_miss_pairs(
+    labels: Sequence[int], vectors: np.ndarray, cannot_link: np.ndarray, low: float, high: float
+) -> list[tuple[float, int, int]]:
+    """(average distance, cluster a, cluster b) for cluster pairs with low < distance <= high
+    and no cannot-link between them, closest first (ties by label: deterministic).
+    Pairs kept apart by the same-document constraint are not asked: measured on the
+    assessment corpus, 67 such pairs within the threshold were nearly all different rules
+    (Berlin vs Munich allowance, band minimum vs maximum, primary vs secondary caregiver)."""
+    members: dict[int, list[int]] = defaultdict(list)
+    for row, label in enumerate(labels):
+        members[label].append(row)
+    dist = 1.0 - np.clip(vectors @ vectors.T, -1.0, 1.0)
+    pairs = []
+    for a, b in combinations(sorted(members), 2):
+        block = np.ix_(members[a], members[b])
+        if cannot_link[block].any():
+            continue
+        d = float(dist[block].mean())
+        if low < d <= high:
+            pairs.append((d, a, b))
+    return sorted(pairs)
+
+
+def _representatives(rows: list[int], facts: Sequence[Fact], keys: Sequence[str]) -> list[Fact]:
+    """One fact per distinct key text, in fact_id order, at most FACTS_PER_SIDE."""
+    seen: set[str] = set()
+    out: list[Fact] = []
+    for row in rows:
+        if keys[row] not in seen:
+            seen.add(keys[row])
+            out.append(facts[row])
+    return out[:FACTS_PER_SIDE]
+
+
+def merge_judged(
+    labels: list[int],
+    vectors: np.ndarray,
+    cannot_link: np.ndarray,
+    facts: Sequence[Fact],
+    keys: Sequence[str],
+    judge: Judge,
+    low: float,
+    high: float = NEAR_MISS_MAX,
+) -> list[int]:
+    """Labels after merging the near-miss cluster pairs the judge says are one rule."""
+    pairs = near_miss_pairs(labels, vectors, cannot_link, low, high)
+    if not pairs:
+        return labels
+    members: dict[int, list[int]] = defaultdict(list)
+    for row, label in enumerate(labels):
+        members[label].append(row)
+    questions = [
+        (_representatives(members[a], facts, keys), _representatives(members[b], facts, keys)) for _, a, b in pairs
+    ]
+    verdicts = judge(questions)
+
+    root = {label: label for label in members}
+
+    def find(label: int) -> int:
+        while root[label] != label:
+            label = root[label]
+        return label
+
+    groups = {label: list(rows) for label, rows in members.items()}
+    for (_, a, b), same in zip(pairs, verdicts):
+        ra, rb = find(a), find(b)
+        if not same or ra == rb or cannot_link[np.ix_(groups[ra], groups[rb])].any():
+            continue
+        keep, drop = min(ra, rb), max(ra, rb)
+        root[drop] = keep
+        groups[keep].extend(groups.pop(drop))
+    return [find(label) for label in labels]
+
+
 def assign_rule_keys(
     facts: Sequence[Fact],
     embed: Callable[[list[str]], np.ndarray],
     threshold: float = DEFAULT_THRESHOLD,
+    judge: Judge | None = None,
 ) -> list[Fact]:
     ordered = sorted(facts, key=lambda f: f.fact_id)
     if not ordered:
@@ -138,12 +285,10 @@ def assign_rule_keys(
 
     keys = [fact_key_text(f) for f in ordered]
     matrix = np.stack([vectors[k] for k in keys])
-    docs = np.array([f.doc_id for f in ordered])
-    key_arr = np.array(keys)
-    numbers = [key_numbers(k) for k in keys]
-    same_doc_other_key = (docs[:, None] == docs[None, :]) & (key_arr[:, None] != key_arr[None, :])
-    different_numbers = np.array([[bool(a and b and a != b) for b in numbers] for a in numbers])
-    labels = average_linkage_labels(matrix, threshold, same_doc_other_key | different_numbers)
+    forbidden = cannot_link_matrix(ordered, keys)
+    labels = average_linkage_labels(matrix, threshold, forbidden)
+    if judge is not None:
+        labels = merge_judged(labels, matrix, forbidden, ordered, keys, judge, low=threshold)
 
     clusters: dict[int, list[Fact]] = defaultdict(list)
     for label, fact in zip(labels, ordered):

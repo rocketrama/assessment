@@ -120,6 +120,34 @@ def test_changed_chunk_text_is_re_extracted(cache):
     assert [f.value for f in facts if f.chunk_id == "POL::000"] == ["14"]
 
 
+def test_chunk_skipped_in_a_batch_is_retried_alone(cache):
+    """Eval finding: the model skipped one FAQ answer in a long batch; alone, it extracted it."""
+
+    class SkipsInBatches(ScriptedProvider):
+        def chat(self, model, system, user, max_tokens, timeout):
+            ids = re.findall(r'<document id="([^"]+)">', user)
+            self.requests.append(ids)
+            facts = [f for i in ids for f in self.facts_by_chunk.get(i, []) if len(ids) == 1 or i != "POL::001"]
+            return json.dumps({"facts": facts})
+
+    provider = SkipsInBatches(SCRIPT)
+    facts, stats = run(provider, cache, chunks=(SICK, CARRY))
+    assert provider.requests == [["POL::000", "POL::001"], ["POL::001"]]
+    assert stats.retried_alone == 1 and stats.llm_calls == 2
+    assert [f.value for f in facts if f.chunk_id == "POL::001"] == ["10", "31 March"]
+    again = ScriptedProvider(SCRIPT)
+    run(again, cache, chunks=(SICK, CARRY))
+    assert again.requests == []  # the retry's result is cached
+
+
+def test_empty_chunk_is_retried_once_only(cache):
+    provider = ScriptedProvider({})
+    facts, stats = run(provider, cache, chunks=(SICK, CARRY))
+    assert provider.requests[0] == ["POL::000", "POL::001"]
+    assert sorted(provider.requests[1:]) == [["POL::000"], ["POL::001"]]  # the retries run in parallel
+    assert facts == [] and stats.retried_alone == 2
+
+
 def test_failed_batch_is_not_cached(cache):
     _, stats = run(ScriptedProvider(SCRIPT, fail_ids={"POL::000"}), cache)
     assert stats.failed_chunks == ["POL::000", "POL::001"]

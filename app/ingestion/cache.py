@@ -99,7 +99,7 @@ CREATE TABLE IF NOT EXISTS chunk_vectors (
 );
 """
 
-_TABLES = ("meta", "parse_cache", "fact_cache", "embedding_cache", "documents", "chunks", "chunk_vectors", "holidays", "facts")
+_TABLES = ("meta", "parse_cache", "fact_cache", "rule_judge_cache", "embedding_cache", "documents", "chunks", "chunk_vectors", "holidays", "facts")
 
 
 def cache_db_path(cache_dir: str) -> str:
