@@ -1,5 +1,5 @@
 """Vision-model page transcription for scanned PDFs, via an OpenAI-compatible API
-(OpenAI, or NVIDIA with LLM_BASE_URL).
+(OpenAI, NVIDIA or Gemini).
 
 The prompt is fixed and tool-less: transcribe verbatim, never correct or
 summarise. The request holds an image and instructions only, so it carries 0
@@ -13,6 +13,7 @@ import time
 from openai import OpenAI
 
 from app.config import Settings
+from app.llm.client import openai_compatible_endpoint
 
 log = logging.getLogger("veltrix.llm")
 
@@ -40,15 +41,14 @@ class VisionTranscriber:
     def from_settings(cls, settings: Settings) -> "VisionTranscriber | None":
         if not settings.vision_model:
             return None
-        keys = {"nvidia": settings.nvidia_api_key, "openai": settings.openai_api_key}
-        key = keys.get(settings.llm_provider)
+        key, base_url = openai_compatible_endpoint(settings)
         if not key:
             log.warning(
                 "vision OCR disabled: no API key for provider",
                 extra={"provider": settings.llm_provider, "vision_model": settings.vision_model},
             )
             return None
-        return cls(settings.vision_model, key, settings.llm_base_url or None)
+        return cls(settings.vision_model, key, base_url)
 
     def transcribe(self, image_jpeg: bytes) -> str:
         data_url = "data:image/jpeg;base64," + base64.b64encode(image_jpeg).decode("ascii")

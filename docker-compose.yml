@@ -6,6 +6,9 @@ services:
     env_file:
       - path: .env
         required: false
+    environment:
+      # The image's own Tesseract (PATH); a host path in .env (e.g. a Windows .exe) doesn't exist here
+      TESSERACT_CMD: ""
     volumes:
       # Reviewers replace ./data with their own copy (TASK.pdf §10.1)
       - ./data:/app/data

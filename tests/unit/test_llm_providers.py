@@ -1,12 +1,12 @@
 """The provider adapters send what each SDK expects (§10.3: reviewers use their own
-OpenAI / Anthropic key). The SDK clients are replaced by recorders — no network."""
+OpenAI / Anthropic / Gemini key). The SDK clients are replaced by recorders — no network."""
 
 from types import SimpleNamespace
 
 import pytest
 
 from app.config import Settings
-from app.llm.client import AnthropicProvider, LLMClient, OpenAICompatibleProvider
+from app.llm.client import AnthropicProvider, LLMClient, OpenAICompatibleProvider, openai_compatible_endpoint
 
 
 class FakeCompletions:
@@ -64,6 +64,10 @@ def test_anthropic_request_shape():
     [
         ("openai", "openai_api_key", OpenAICompatibleProvider),
         ("nvidia", "nvidia_api_key", OpenAICompatibleProvider),
+        ("gemini", "google_api_key", OpenAICompatibleProvider),
+        ("google", "google_api_key", OpenAICompatibleProvider),
+        ("openrouter", "openrouter_api_key", OpenAICompatibleProvider),
+        ("mistral", "mistral_api_key", OpenAICompatibleProvider),
         ("anthropic", "anthropic_api_key", AnthropicProvider),
     ],
 )
@@ -71,6 +75,27 @@ def test_from_settings_picks_the_provider(provider, key_field, expected):
     settings = Settings(_env_file=None, llm_provider=provider, llm_model="m", **{key_field: "k"})
     client = LLMClient.from_settings(settings)
     assert isinstance(client.provider, expected) and client.model == "m"
+
+
+GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/openai/"
+
+
+@pytest.mark.parametrize(
+    "fields, expected_url",
+    [
+        ({"llm_provider": "gemini"}, GEMINI_URL),  # TASK.pdf §10.2: GOOGLE_API_KEY alone is enough
+        ({"llm_provider": "gemini", "llm_base_url": "https://proxy.example/v1"}, "https://proxy.example/v1"),
+        ({"llm_provider": "openai"}, None),  # SDK default
+        ({"llm_provider": "openrouter"}, "https://openrouter.ai/api/v1"),
+        ({"llm_provider": "mistral"}, "https://api.mistral.ai/v1"),
+    ],
+)
+def test_openai_compatible_endpoint_base_url(fields, expected_url):
+    settings = Settings(
+        _env_file=None, google_api_key="g", openai_api_key="o", openrouter_api_key="r", mistral_api_key="m", **fields
+    )
+    key, base_url = openai_compatible_endpoint(settings)
+    assert key and base_url == expected_url
 
 
 @pytest.mark.parametrize(

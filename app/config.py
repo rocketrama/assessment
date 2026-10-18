@@ -24,6 +24,12 @@ class Settings(BaseSettings):
     openai_api_key: str = ""
     anthropic_api_key: str = ""
     nvidia_api_key: str = ""
+    # Gemini (LLM_PROVIDER=gemini or google); the variable name TASK.pdf §10.2 gives
+    google_api_key: str = ""
+    # OpenRouter (LLM_PROVIDER=openrouter); model IDs like openai/gpt-4.1-mini
+    openrouter_api_key: str = ""
+    # Mistral (LLM_PROVIDER=mistral); model IDs like mistral-small-latest
+    mistral_api_key: str = ""
     llm_max_concurrency: int = 4
     llm_timeout_seconds: float = 12.0
     # Sent as reasoning_effort to OpenAI-compatible reasoning models (e.g. gpt-oss); empty = not sent
