@@ -223,6 +223,39 @@
       route: [rag]
       answer_has: [["whole day", "whole days", "full day", "full days"]]
 
+# Worded differently from the documents: no shared keywords, so only vector search finds them.
+- id: paraphrase-sick
+  tags: [docs, paraphrase]
+  employee: E1002
+  turns:
+    - say: Can I get time off when I'm unwell?
+      route: [rag, hybrid]
+      cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
+      cite_ok: [POL-LEAVE-GLOBAL-V3, ADD-LEAVE-US]
+      cite_none: [FAQ-LEAVE, POL-LEAVE-GLOBAL-V1]
+      answer_has: ["12"]
+
+- id: paraphrase-bereavement
+  tags: [docs, paraphrase, faq-outdated]
+  employee: E1002
+  turns:
+    - say: My grandmother passed away, how long can I stay home?
+      route: [rag, hybrid]
+      cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
+      cite_none: [FAQ-LEAVE, POL-LEAVE-GLOBAL-V1]
+      answer_has: ["5"]
+
+- id: paraphrase-wfh
+  tags: [docs, paraphrase]
+  employee: E1003
+  turns:
+    - say: Can I do my job from my house?
+      route: [rag, hybrid]
+      cite_all: [POL-REMOTE-WORK]
+      cite_ok: [FAQ-LEAVE]
+      cite_none: [MEMO-HYBRID-2026]
+      answer_has: ["2"]
+
 - id: notice-period-by-level
   tags: [docs, table]
   employee: E1001
@@ -375,7 +408,7 @@
       route: [hybrid]
       cite_any: [TBL-LEAVE-ACCRUAL, ADD-LEAVE-IN]
       tool: {name: get_leave_balance, status: success}
-      answer_has: ["1.5"]
+      answer_has: ["1.5", "18"]
 
 # --- leave changes ------------------------------------------------------------------------
 - id: apply-and-confirm
