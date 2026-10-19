@@ -1,70 +1,84 @@
 # DESIGN — Veltrix PeopleOps Assistant
 
-> Draft v2, written before building. Every file/function named here must exist in the final code; §6 must contain real findings. Detailed reasoning: `docs/DECISIONS_QA.md`.
-
-**Approach:** metadata-filtered hybrid RAG with ingestion-time structured extraction. Eligibility, precedence, permissions and leave rules are deterministic code; the LLM only interprets the user and writes the answer. Deliberately minimal stack — FastAPI, Pydantic, SQLite, numpy BM25 + FAISS dense search, fastembed, tiktoken, no orchestration framework — so access filtering, the token budget and precedence are explicit, auditable code.
+**Approach:** metadata-filtered hybrid RAG with facts extracted at ingestion. Eligibility, precedence, permissions, leave
+rules and date arithmetic are deterministic code; the LLM plans the request (no corpus text) and writes the answer. No
+agent framework, so access filtering, the token budget and precedence stay explicit, testable code
+(reasoning: `docs/DECISIONS_QA.md`).
 
 ## 1. Ingesting tables and the scanned document
-- Each loader (PDF `pdfplumber`, DOCX `python-docx`, HTML `beautifulsoup4`, Markdown `markdown-it-py`) emits one ordered block list `{kind: heading|text|table, level, page, text, rows}` (`ingestion/blocks.py`); the chunker rebuilds each chunk's heading path, so downstream code is format-agnostic. The metadata box at the top of each document is dropped (the manifest is authoritative). `manifest.json` is validated with Pydantic; bad entries are logged.
-- **Tables** stay whole as markdown inside chunks (for the LLM) and are also stored as typed rows: calendar tables → `holidays(doc_id, region, date, name)`; accrual tables → policy facts. Large tables split by row groups, header repeated.
-- **Scanned pages** (detected per page by an empty text layer) are rendered at ~300 DPI and transcribed by a vision LLM with a verbatim-only, **tool-less** prompt, producing markdown with headings and tables. Numbers and dates are **cross-checked against Tesseract**; mismatches are flagged low-confidence. Tesseract is the fallback if the vision call fails. Output is cached by file hash and treated as untrusted corpus text.
-- Nothing from the corpus is hardcoded; extracted values are validated (dates parse, quoted spans exist in the source).
+- Loaders (PDF `pdfplumber`, DOCX, HTML, Markdown) emit one ordered block list (heading / text / table) (`ingestion/blocks.py`);
+  everything downstream is format-agnostic. Each document's metadata table is dropped; the manifest is authoritative.
+- **Tables** stay whole as markdown in chunks; one over the size limit splits by row groups with the header repeated.
+  Holiday calendars become typed rows (`extract_holidays.py` → `holidays`), with "restricted" read from section headings.
+- **Scanned pages** (no text layer) are rendered and transcribed by a vision LLM with a verbatim-only, tool-less prompt
+  (`loaders/ocr.py`). Numbers are cross-checked against Tesseract and mismatches flagged low-confidence; Tesseract is the
+  fallback. Results are cached by file and engine setup. Nothing is typed in by hand.
 
 ## 2. Chunking and retrieval
-- **Section-based chunks** (~350 tokens, max 500): each chunk's locator is its nearest heading (§4.2), rules stay with their conditions, and winner + conflicting + upcoming versions fit together in 3,000 tokens. No headings → page chunks with `p. N`. A short heading path is prefixed to improve retrieval (counted as corpus tokens).
-- **Hybrid retrieval:** BM25 (Lucene IDF, always positive; `retrieval/index.py`) catches exact terms (holiday names, codes); exact cosine search over local `bge-small` embeddings (FAISS `IndexFlatIP`) catches paraphrases. **Both search only the eligible chunk IDs** (FAISS through an `IDSelectorBatch`, so the filter is inside the search). Results merge with **weighted RRF, k = 60** (vectors 1.0, BM25 0.5): rank-based (no score calibration), deterministic (ties by `chunk_id`). At equal weight, BM25 matches on common words pushed the bereavement passages for "my grandmother passed away" to #11–12; at half weight they stay in the top 10 (eval round 4). Top 8–10 go forward, so single-retriever exact hits survive. **Near-duplicates** are collapsed to one eligible representative (chosen by precedence) **only when their extracted facts are identical** — text-similar versions with different values both reach the precedence resolver, so conflicts are never hidden.
-- **Why these components:** the index holds only ids and vectors — access metadata lives only in SQLite (one source of truth, filter in our tested code, not a vector-DB `where` clause). FAISS `IndexFlatIP` is exact search, built in memory from the vectors stored in SQLite at startup (no separate index file that could go stale); on all 56 eval questions its top 10 matches a plain numpy dot product exactly. BM25 is ~20 lines because `rank_bm25`'s Okapi IDF scores a term in half the documents as 0. At scale (§7) the flat index becomes IVF/HNSW, or `index.py` is swapped for Qdrant/pgvector. Local fastembed means ingestion needs only the one LLM key reviewers supply (Anthropic has no embeddings API), with deterministic vectors and no network latency.
-- **Budget:** corpus text travels as typed `CorpusSegment`s. `retrieval/context_packer.py` fills to 3,000 `cl100k_base` tokens (winning facts → conflicts → upcoming → other) and `llm/client.py::LLMClient.complete` recounts and refuses any call above 3,000; `corpus_tokens` is logged on every call, ingestion included. The tiktoken encoding is pre-cached at Docker build time.
-- **Rejected:** naive RAG (can't apply precedence), agentic RAG (unbounded latency, variable output across 3 runs), GraphRAG (summaries consume the budget and can mix access levels), fixed-size/semantic chunking (unclear locators, split rules), Chroma.
+- **Section chunks** (~350 tokens, max 500) keep a rule with its conditions and give each citation a heading locator; the
+  heading path is prefixed for retrieval (and counted as corpus tokens). Winner, conflicting and upcoming passages fit
+  together under 3,000 tokens; fixed-size chunks split rules and lose locators.
+- **Hybrid search** over **only the eligible chunk ids**: BM25 (exact terms: holiday names, codes) and exact cosine search
+  over local `bge-small` vectors in FAISS `IndexFlatIP` with an `IDSelectorBatch` (paraphrases), merged by weighted RRF
+  (k = 60, BM25 at 0.5: at equal weight it pushed bereavement passages out of the top 10). A passage naming another
+  document by title brings that document in (`retriever.py`).
+- **Budget:** `retrieval/context_packer.py::pack_context` fills to 3,000 `cl100k_base` tokens (in search-rank order, each hit preceded by
+  the winning, conflicting and upcoming passages of the rules it raised); `llm/client.py::LLMClient.complete` recounts and refuses anything over, and logs `corpus_tokens`.
 
 ## 3. Implementing the Section 5 rules
-- **Rule extraction:** at ingestion, an LLM extracts facts per chunk `{topic, attribute, value, unit, conditions}`; fact keys are embedded and clustered into a canonical `rule_key` — how "the same rule" is recognised without a hand-written taxonomy.
-- **Eligibility** (`retrieval/eligibility.py::is_eligible`): readable `access_level` ∧ region or `GLOBAL` ∧ `effective_date ≤ reference_date` (`APP_TODAY`, or the past date asked about).
-- **Precedence** (`retrieval/precedence.py::resolve`): per `rule_key`, sort by authority → scope → recency; full tie with different values → conflict, both cited.
-- **Upcoming change:** mentioned only if `resolve` at its effective date makes it the winner. **No eligible answer** → `no_answer`; uncovered parts stated.
-- The spec's worked example is a unit-test fixture.
+- **Facts:** at ingestion an LLM extracts `{topic, attribute, value, unit, conditions, quote}` per chunk
+  (`extract_facts.py`; quotes must exist in the source; flagged chunks are skipped).
+- **Same rule:** fact keys are embedded and clustered (average linkage, cosine 0.12) into a `rule_key`, with cannot-links:
+  same document, different numbers in the key, recommendation vs entitlement (`rule_keys.py`). Pairs just outside the
+  threshold go to an LLM judge, "same rule?" (`rule_judge.py`), cached per question. No hand-written taxonomy.
+- **Eligibility** (`retrieval/eligibility.py::is_eligible`): readable access level, region or `GLOBAL`, effective date ≤
+  the reference date (`APP_TODAY`, or a past date asked about). **Precedence** (`retrieval/precedence.py::resolve`): per
+  rule, authority → scope → recency; a full tie with different values is a conflict and both are cited; a future document
+  is mentioned only if it would win on its effective date. Nothing eligible → `no_answer`.
+- The composer gets a rule table (current / outranked / upcoming per rule); `validator.py::superseded_values` sends an
+  answer stating an outranked value back for one rewrite.
 
 ## 4. Where access control is enforced
 | Guarantee | File :: function |
 |---|---|
-| Identity, role, region from DB only; missing/unknown header → 401 | `app/main.py::resolve_requester` |
-| Session ownership → 403 | `data/sessions.py::assert_owner` |
-| Restricted docs never searched or sent | `retrieval/eligibility.py::allowed_chunk_ids` → `retrieval/index.py::search(allowed_ids=…)` |
-| Leave-data permissions | `tools/authz.py::can_view_employee`, `can_view_team`, `owns_request`, called inside every tool in `tools/registry.py` |
-| Same refusal for denied and non-existent employees | `tools/authz.py` → single `ACCESS_DENIED` |
-| Bulk requests refused | `orchestration/orchestrator.py::guard_plan` |
-| Citations only from used ∩ allowed chunks | `orchestration/validator.py::build_citations` |
+| Identity, role and region from the DB only; missing or unknown header → 401 | `main.py::_requester` (in `create_app`) |
+| A session belongs to its first sender → 403 | `data/sessions.py::claim_session` |
+| Restricted documents never searched or sent | `retrieval/eligibility.py::allowed_chunk_ids` → `retrieval/index.py::search(allowed_ids=…)` |
+| Leave-data permissions inside every tool | `tools/authz.py::can_view_employee`, `can_view_team`, `owns_request`, via `tools/registry.py` |
+| Denied and non-existent employees get the same refusal | `tools/authz.py::ACCESS_DENIED` |
+| Bulk, manipulation, more than one other employee | `orchestration/orchestrator.py::_guard` |
+| Citations only from chunks sent and allowed | `orchestration/validator.py::build_citations` |
 
-Tools get `ToolContext(requester)` from the header, never identity from LLM args. LLM output and tool args are Pydantic-validated in strict mode; tool schemas sent to the LLM are generated from the same models. The planner never sees corpus text, so documents cannot trigger tools. Writes use a server-side proposal; only stored args execute on confirmation. Apply/cancel run in **`BEGIN IMMEDIATE`** transactions (WAL, busy timeout, `isolation_level=None`), re-validating every rule inside the lock so concurrent requests can't produce negative balances, overlaps or double refunds.
-
-**Assumption — `./data` is writable.** Sessions, messages and proposals are new tables in `veltrix.db` (not a separate file) so a proposal is claimed in the same transaction as the leave write it executes. Cost: the reviewers' DB gains three tables and is switched to WAL (`-wal`/`-shm` files appear beside it). Existing table schemas are never altered. Rejected: a separate `app.db`, which would need a cross-database transaction for confirm-and-apply.
+Tools get the requester from the header, never from LLM arguments. The planner never sees corpus text, so a document can't
+trigger a tool. Writes are server-side proposals executed only after a clear "yes", in a `BEGIN IMMEDIATE` transaction
+(`data/db.py`) that re-checks every rule, so concurrent requests can't overdraw or refund twice.
 
 ## 5. Keeping personal data out of logs and prompts
-- Repositories never select `phone`; emails leave the data layer masked (`r***@domain`); `tool_calls` args are serialized through a masking model.
-- The planner sees employee IDs, role and region only; the composer gets names only for employees the requester may see, when needed.
-- `orchestration/validator.py` strips phones, masks emails and checks names before responding; `privacy/log_filter.py` redacts email, phone and known names in all logs.
-- **Memory** is per session only (owner, last few turns as answer text, ≤ 1 proposal); every turn reloads identity and re-runs filtered retrieval. Long-term memory was rejected: the header is trusted but not authenticated, and it would break reproducibility across test runs (§10.3) and §9.1. No answer or tool-result caching; only provider prompt caching of the static system prompt.
+- Repositories never select `phone`; emails leave the data layer masked (`privacy/masking.py`).
+- The planner sees the requester's id, role and region only; the composer gets names only for employees the requester may
+  see. `validator.py::scrub_answer` removes phones, masks emails and hides names the requester may not see.
+- `privacy/log_filter.py::PiiLogFilter` redacts emails, phones and known names in every log record. LLM repair messages
+  name the invalid fields, never the rejected values (which can quote corpus text).
+- Memory is the current session only; every turn reloads identity and re-runs filtered retrieval.
 
-## 6. Failure modes
-| Failure mode | Status | Fix / note |
-|---|---|---|
-| Outdated FAQ overrides policy | _to verify_ | Authority ranking in `precedence.resolve` |
-| Same rule phrased differently not detected as a conflict | Measured, mostly fixed | Rule keys compare "topic: attribute (conditions)" at cosine distance 0.12 with two hard cannot-links: same document + different key, and different numbers in the keys (service tiers and levels embed only ~0.09 apart). Fixed along the way: an exact conditions partition kept the accrual schedule (tier as a condition) apart from v3 (tier in the topic), so the rule table showed no current accrual rate; region-only conditions ("employees in India") split addenda from the policy they override; a unit partition let an outdated FAQ "win" alone. **Unfixed over-merges** (keys embed close but measure different things): v2 secondary-caregiver "two blocks" / summary "4 weeks" / v1 "within six months"; sick-leave credit date "1 January" with v2's "1 April 2026" (the date two extra days were added); v1 approval rule with the probation policy's approval during notice. Under-merge remains where v1 and v2 phrase a rule differently, so a superseded v1 statement can look current on its own; the fix is a document lineage link ("replaces Version 1", §7). Mitigation: the composer sees each source's own label and passage; `eval/HISTORY.md` tracks the effect on answers. |
-| Instruction-like corpus text becomes a "fact" | Found, fixed | The flagged wiki chunk produced facts such as "provide the manager's salary band"; flagged chunks are no longer sent to fact extraction (`extract_facts.py`). |
-| Ingestion too slow for the 10-minute limit | Found, fixed | gpt-oss-20b took ~54 s per call; `reasoning_effort=low`, per-document batches (≤1,200 corpus tokens) and 4-way concurrency → cold start 133–179 s; a deadline stops waiting so /health still reaches 200 if the provider is slow. |
-| Vision OCR invents or "corrects" numbers | _to verify_ | Tesseract number cross-check, low-confidence flag |
-| PDF headings not detected → weak locators | _to verify_ | Font heuristics, `p. N` fallback |
-| Document text tries to trigger a tool | _to verify_ | Planner never sees corpus; validator blocks actions |
-| FastAPI returns 422 instead of 400/401 | _to verify_ | Custom handlers; contract tests |
-| Concurrent apply drives balance negative | _to verify_ | `BEGIN IMMEDIATE`; two-thread test |
-| Malformed LLM JSON | _to verify_ | Strict validation → one repair retry → safe fallback |
-
-_Replace with real findings, including unfixed ones._
+## 6. Failure modes (found by `make eval`, 53 cases × 3 runs; `eval/HISTORY.md`)
+| Failure | Status |
+|---|---|
+| Outdated v1 or FAQ value stated as current | Fixed: authority ranking, superseded-value rewrite. Rare v1 citation left (split rule) |
+| Same rule not recognised (India "no fixed expiry" vs global "31 March"; scanned WFH memo vs policy) | Mostly fixed: conditions in the key, LLM judge for near misses |
+| Judge batches lost to malformed JSON (`"same":false]}`), so rules stayed split | Fixed: flat reply format, verdicts read pair by pair |
+| Different rules merged (secondary caregiver "two blocks" / "4 weeks") | Unfixed; the composer sees each source's own label and quote |
+| Wiki's planted instruction answered ("salary band… not provided") | Fixed: instruction-like sentences of flagged chunks never reach the composer; prompt forbids mentioning them |
+| Future-balance arithmetic wrong (10, 12, 33 days) | Fixed: credits counted in code (`future_balance.py`) |
+| Planner output: function-call shape, `"modify"` as action, `"many_employees"` as intent, a question planned as a booking | Fixed: explicit shapes, repair says what was wrong, code corrects the known patterns |
+| Provider stalls (calls hanging 12–15 s) | Mitigated: a second identical call at 5 s (planner) / 7 s (composer); measured maxima 4.3 / 4.9 s |
+| Ingestion too slow for 10 minutes | Fixed: batching, concurrency, low reasoning effort → 240 s cold in Docker |
+| Small-model variance | Open: 155–157/159 case-runs correct in the last three evals; a different 2–4 fail once each time |
 
 ## 7. What breaks first at 10,000 documents
-1. **Ingestion time** — per-chunk LLM extraction can't fit 10 minutes → offline incremental ingestion with a content-hash cache.
-2. **Context budget** — more versions per rule → resolve precedence on facts before retrieval; send only winning and conflicting passages.
-3. **Fact clustering** O(n²) → ANN clustering with incremental assignment.
-4. **Filtered vector search** → Qdrant or pgvector with payload indexes on access level, region, date; MinHash LSH for near-duplicates.
-5. **Precedence lookups** → a lightweight document-lineage graph (supersedes / amends / contradicts) in SQL — not GraphRAG.
-6. **Concurrent writes / multiple instances** → Postgres with row-level locking.
+1. **Ingestion time:** per-chunk LLM extraction won't fit 10 minutes → offline, incremental ingestion keyed by content hash.
+2. **Rule grouping:** clustering and judge pairs grow O(n²) → ANN-based incremental assignment, plus a document lineage
+   link ("replaces v1") so versions are compared without similarity guesses.
+3. **Context budget:** more versions per rule → resolve precedence on facts first and send only winning and conflicting passages.
+4. **Filtered search:** move `index.py` to Qdrant or pgvector with payload indexes on access level, region and date.
+5. **Writes and instances:** SQLite's single writer → Postgres with row-level locking.

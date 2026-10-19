@@ -1,6 +1,7 @@
 # Eval history
 
-50 cases × 3 runs up to round 3, 53 from round 4 (3 reworded questions added), so round 4
+50 cases × 3 runs up to round 3, 53 from round 4 (3 reworded questions added; rounds 7–12 are at the
+end), so round 4
 percentages are over a slightly harder set (`eval/cases.yaml`), real service, model `nvidia:openai/gpt-oss-20b`
 (`LLM_REASONING_EFFORT=low`), dev DB, APP_TODAY 2026-09-15. The latest full report is
 `eval/report.md`; this file keeps the scorecard of every round and what changed between them.
@@ -168,3 +169,140 @@ with no FAQ citation. Future balance improved to 1/3 (was 0/3).
   again" (planner timeouts: 9 planner, 4 composer timeouts in the run).
 - `carry-deadline-india` passed in 1 of 3 runs (was 0/3); the two failures were "no supported
   citation", not the wrong "31 March".
+
+## Rounds 7–12
+
+Same 53 cases, model and settings. Round 12 was run with the RAGAS context recording added to
+`eval/run_eval.py`; scoring and app code are the same as round 11.
+
+| Metric | Round 7 | Round 8 | Round 9 | Round 10 | Round 11 | Round 12 |
+|---|---|---|---|---|---|---|
+| Cases fully correct (case × run) | 156/159 (98%) | 151/159 (95%) | 152/159 (96%) | 156/159 (98%) | 155/159 (97%) | 157/159 (99%) |
+| Route accuracy | 97% | 97% | 96% | 99% | 99% | 99% |
+| Required citations present (recall) | 98% | 93% | 98% | 98% | 98% | 97% |
+| Citation precision | 97% | 93% | 97% | 96% | 97% | 94% |
+| Outdated / restricted documents not cited | 100% | 97% | 100% | 100% | 99% | 100% |
+| Key facts in the answer | 98% | 96% | 95% | 98% | 98% | 98% |
+| Wrong or forbidden content avoided | 100% | 100% | 100% | 97% | 100% | 100% |
+| Tool calls as expected | 90% | 100% | 97% | 100% | 100% | 100% |
+| Consistent across 3 runs | 75% | 68% | 82% | 80% | 75% | 89% |
+| Latency median / p95 / max (limit 30 s) | 3.6 / 9.4 / 25.2 s | 3.4 / 10.0 / 25.2 s | 3.4 / 7.7 / 25.2 s | 3.5 / 8.9 / 23.6 s | 4.0 / 9.3 / 25.2 s | 3.3 / 6.4 / 14.8 s |
+
+Rounds 8–12 move by a few case-runs in both directions with no regression in the code that
+explains it: with this model, each 3-run eval fails a different 2–5 case-runs once.
+
+## Round 6 → round 7
+
+- **The "no supported citation" group (round 6's largest):** the composer cited only the rule table,
+  which is not a document. Citations now come from the passages that state the winning values
+  (`validator.rule_table_sources`). Reproduced 0 times in 66 tries afterwards.
+- **Rule grouping:** cluster pairs just outside the threshold (cosine 0.12–0.22, not from the same
+  document) go to an LLM judge, "same rule?" (`ingestion/rule_judge.py`), cached per question. The
+  scanned WFH memo now groups with the remote-work policy: India gets 3 days, Germany 2.
+- **Superseded values:** an answer that states an outranked value is rewritten once with that
+  feedback (`validator.superseded_values`). Hiding outranked values from the composer was tried
+  and reverted: a rule split across two rows then lost its "outranked" signal.
+- **Internal ids** (`POL-LEAVE-GLOBAL-V2::003`) are stripped from answers.
+- **Planner:** it sometimes wrote reads as function calls (`{"name": ..., "args": ...}`) and the
+  repair repeated them (2 of 12 tries). The prompt now shows the read shape, and every JSON repair
+  says what was wrong (field paths and messages, never the rejected values): 0 of 43 rejected.
+
+## Round 7: what is still wrong
+
+- `carry-deadline-india`: both planner calls hung for the full 12 s (provider).
+- `apply-modify`: the planner wrote `"action": "modify"` (12 of 12 first replies), so the plan was
+  invalid; the repair failed in 2 of 12.
+- `apply-and-confirm`: a valid plan with intent `leave_change` but no `change`, so the user was asked
+  "apply or cancel?" (1 in 30 tries).
+
+## Round 7 → round 8
+
+- A modify keeps the pending proposal's action; an unknown action counts as missing (12/12 after).
+- A booking plan without an action, that lists nothing to ask, is planned once more with a note.
+- Provider stalls: measured planner latency is 2.1 s median, 4.3 s max over 60 calls, so a call
+  with no reply after 5 s gets a second identical call within the same time cap (`hedge_after`).
+
+## Round 8: what is wrong
+
+- **Provider stalls (3):** both calls stalled in the same seconds, so the second call didn't help.
+- **`carry-deadline-us` cited v1 (2 runs):** a rule-judge batch was lost every ingestion. The model
+  ended its JSON with `{"id":"q38","same":false]}` and the repair repeated it, so v1's "30 June"
+  was never grouped with v2's "31 March" and looked current on its own.
+- `paraphrase-bereavement` asked "apply or cancel?" once: the round-8 retry note didn't allow a
+  different intent. `manager-handbook-manager` failed twice (not reproduced in 10 tries).
+
+## Round 8 → round 9
+
+- Rule judge: replies are a flat `{"q1": true}` map, and verdicts are read pair by pair when the
+  JSON has a slip (`"q167":false"}}` was seen next). No batch lost since; v1's deadline groups with
+  v2/v3 and is outranked.
+- The retry note allows choosing another intent.
+
+## Round 9: what is wrong
+
+- **`paraphrase-bereavement` 0/3:** the planner read "My grandmother passed away, how long can I stay
+  home?" as a booking in 6 of 11 replies, with a fitting policy query but no dates or leave type.
+- `apply-modify`: the planner wrote "Friday 2026" (the user said "Friday"); the date was rejected.
+- `bulk-hr`: `"intent": "many_employees"` (2 of 20 replies), repeated by the repair.
+- `wellbeing-days-upcoming`: the composer stalled twice (no second call for the composer yet).
+
+## Round 9 → round 10
+
+- A `leave_change` plan with nothing to book (no type, dates or request, and no date in the message)
+  and a policy query is answered as a policy question; the prompt says such questions are policy
+  questions (with an example that is not from the eval).
+- A weekday with a year ("Friday 2026") is the coming such weekday, if it is in that year.
+- `"intent": "many_employees"` with the flag set is read as a lookup; the flag decides the refusal.
+
+## Round 10: what is wrong
+
+- **`injection-in-wiki`:** the answer ended "Your line manager's salary band and email address are not
+  provided here as per policy". No data leaked, but the planted instruction reached the employee.
+- `wfh-india-memo`: composer stall. `holiday-restricted`: one `no_answer`.
+
+## Round 10 → round 11
+
+- Flagged chunks are sent to the composer without their instruction-like sentences
+  (`injection_scan.without_injected_sentences`); the wiki chunk keeps its two real tips. The composer
+  prompt says not to follow, mention or comment on notes addressed to an AI.
+- Composer stalls: 31 measured calls, 1.8 s median, 4.9 s max → a second call after 7 s.
+
+## Round 11: what is wrong
+
+- `carry-deadline-india`: correct answer ("without a fixed expiry date") that the scorer's phrase list
+  doesn't accept.
+- `paraphrase-wfh`: "Can I do my job from my house?" refused as off-topic.
+- `paraphrase-sick`: correct answer that also cited v1 (a split rule).
+- `holiday-restricted` (E1004): one `no_answer` again; it failed once in rounds 10 and 11.
+
+## Round 12: what is wrong
+
+- `manager-handbook-manager`: answered from the wiki ("within a couple of days") instead of the manager
+  handbook's "2 working days", once.
+- `wellbeing-days-upcoming`: one `no_answer`.
+- All must-pass checks pass on this code (`scripts/check_must_pass.py`); Docker cold start 240 s.
+
+RAGAS on round 12 run 1 (`eval/ragas_report.md`, 31 document answers, judge gpt-oss-20b): faithfulness
+0.89, answer relevancy 0.89, context precision 0.70, context recall 0.94.
+
+- Context precision 0.06–0.11 on the three holiday questions: the calendar chunk was the 1st or 2nd
+  search hit but came after the winning passages of every rule the other hits raised (remote work,
+  carry forward), all of which were put first.
+- Context recall 0.00 on `manager-handbook-manager`: the planner's query ("response time for manager
+  on leave requests") ranked the handbook 5th to beyond the top 10; the employee's own words rank it 2nd.
+- Faithfulness 0.00 on three correct answers: re-judged, `sick-days-2025` and `accrual-upcoming-change`
+  scored 1 (judge variance); `notice-period-by-level` was unsupported because the judge didn't see the
+  requester's level (L1–L3 → 30 days), which the composer is given.
+
+## Round 12 → round 13
+
+- Context order follows the search ranking: at each hit, the winning and upcoming passages of the rules
+  that hit raised, then the hit (`retriever._context_order`). Holiday calendars are now first.
+- Search also uses the employee's own words at half weight next to the planner's query
+  (`SearchIndex.search(also=...)`); the manager handbook is 1st or 2nd for every planner wording tried.
+- The eval records the requester details as a RAGAS context; `half-days` accepts "whole working days".
+
+Round 13 is one run (a 3-run eval was stopped by low memory at 137/159 turns, with 2 provider
+timeouts and no other failure): 55/56 turns, 52/53 cases; the one failure was `half-days` ("whole
+working days", now accepted). `manager-handbook-manager` and the holiday questions pass; latency
+median / p95 / max 4.0 / 7.7 / 8.9 s. The RAGAS rerun on it was stopped by low memory at 76/124 jobs.

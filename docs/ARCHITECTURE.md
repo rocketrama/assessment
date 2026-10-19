@@ -1,7 +1,8 @@
 # Veltrix PeopleOps Assistant — Architecture
 
 > Senior AI Engineer assessment. This document is the build blueprint: components, data flow, key design decisions and trade-offs.
-> Status: **draft v1**, written before inspecting the corpus. Sections marked ⚠ must be validated once `corpus/`, `manifest.json` and `veltrix.db` are available.
+> Status: **as built.** Written as the blueprint before the build and updated after it; where the build differs from the
+> plan, this document says so. `DESIGN.md` is the 2-page summary; `eval/HISTORY.md` has what each eval round found and changed.
 
 ---
 
@@ -25,7 +26,7 @@ flowchart LR
     subgraph Startup["Startup (once)"]
         M[manifest.json] --> ING
         C[corpus/*] --> ING[Ingestion pipeline]
-        ING --> IDX[(BM25 + dense index, numpy)]
+        ING --> IDX[(BM25 + FAISS IndexFlatIP)]
         ING --> KDB[(SQLite: chunks, facts, holidays)]
         ING --> READY{{ready flag}}
     end
@@ -43,8 +44,8 @@ flowchart LR
     RET --> KDB
     RES --> KDB
     TOOLS --> DB[(veltrix.db)]
-    PLAN & ANS --> LLM[LLMClient\ntoken guard + logging]
-    LLM --> P[(Anthropic / OpenAI)]
+    PLAN & ANS --> LLM[LLMClient\ntoken guard · logging\nrepair · retry · hedged calls]
+    LLM --> P[(OpenAI · Anthropic · Gemini\nNVIDIA · OpenRouter · Mistral)]
     VAL --> API
     READY -.-> H[GET /health]
 ```
@@ -56,9 +57,9 @@ flowchart LR
 | Concern | Choice | Reason / trade-off |
 |---|---|---|
 | API | **FastAPI + Uvicorn**, Pydantic v2 models | Strict request/response schemas → exact contract, free 400 handling. |
-| LLM | **Anthropic (default)** behind `LLMProvider` interface; OpenAI adapter | Reviewers use their own key; native tool/JSON output; temperature 0. |
+| LLM | One `Provider` interface (`llm/client.py`): Anthropic, and an OpenAI-compatible client for OpenAI, Gemini, NVIDIA, OpenRouter and Mistral | Reviewers use their own key; JSON output validated with Pydantic; temperature 0. Eval runs used `openai/gpt-oss-20b` on NVIDIA. |
 | Embeddings | **fastembed `BAAI/bge-small-en-v1.5`** (ONNX, CPU) | No torch → small image, fast startup, no external dependency at query time. |
-| Vector store | **numpy exact cosine** over the allowed rows only (`retrieval/index.py`) | Corpus is tiny; exact search, same results as FAISS `IndexFlatIP` without its compiled dependency; only allowed rows are ever scored, so restricted chunks are never candidates. |
+| Vector store | **FAISS `IndexFlatIP`** (exact inner product) with an `IDSelectorBatch` of the allowed chunks (`retrieval/index.py`) | Exact search, built in memory at startup from vectors stored in SQLite; the filter is inside the search, so restricted chunks are never candidates. Started as a numpy dot product; on all 56 eval questions FAISS returns the identical top 10. |
 | Lexical | **BM25, own ~20 lines** (Lucene IDF) | Policy questions are keyword-heavy ("sick leave", "carry forward"); hybrid beats dense alone. `rank_bm25`'s Okapi IDF gives 0 to terms in half the documents, which hurts small allowed sets; statistics are computed over the allowed set only. |
 | Fusion | **Reciprocal Rank Fusion** | Parameter-light, stable, deterministic. |
 | Parsing | `pypdf`/`pdfplumber` (PDF + tables), `python-docx`, `markdown-it`, `BeautifulSoup` | Each preserves headings and tables in a common block model. |
@@ -78,25 +79,32 @@ veltrix-assistant/
 │   ├── api/schemas.py          # ChatRequest, ChatResponse, Citation, ToolCall
 │   ├── ingestion/
 │   │   ├── pipeline.py         # orchestrates ingestion, sets ready flag
+│   │   ├── manifest.py         # manifest.json validation
 │   │   ├── loaders/            # pdf.py, docx.py, markdown.py, html.py, ocr.py
 │   │   ├── blocks.py           # normalized Block/Section model
 │   │   ├── chunker.py          # structure-aware chunking
-│   │   ├── dedup.py            # near-duplicate clustering
 │   │   ├── extract_facts.py    # LLM → typed policy facts
+│   │   ├── rule_keys.py        # facts → rule keys: clustering + cannot-links
+│   │   ├── rule_judge.py       # LLM "same rule?" verdicts for near misses
 │   │   ├── extract_holidays.py # calendar tables → holidays rows
-│   │   └── injection_scan.py   # flags instruction-like text
+│   │   ├── injection_scan.py   # flags instruction-like text; strips it before the composer
+│   │   └── cache.py            # cache.db: parse/fact/judge/embedding caches, current corpus
 │   ├── retrieval/
+│   │   ├── corpus.py           # chunks, documents and facts loaded from cache.db
 │   │   ├── eligibility.py      # access/region/date rules (pure functions)
-│   │   ├── index.py            # BM25 + dense (numpy), RRF, search over allowed ids only
+│   │   ├── index.py            # BM25 + FAISS IndexFlatIP, RRF, search over allowed ids only
+│   │   ├── retriever.py        # eligible search, linked documents
 │   │   ├── precedence.py       # authority → scope → recency resolver
 │   │   └── context_packer.py   # token-budgeted context assembly
 │   ├── orchestration/
-│   │   ├── orchestrator.py     # main pipeline per message
+│   │   ├── orchestrator.py     # main pipeline per message, guards
 │   │   ├── planner.py          # intent + slot extraction (LLM)
 │   │   ├── dates.py            # date phrase resolution & validation
 │   │   ├── proposals.py        # propose/confirm state machine
+│   │   ├── future_balance.py   # credit-date counting for future balances
+│   │   ├── tool_answers.py     # answers for tool-only turns, written in code
 │   │   ├── composer.py         # answer LLM call
-│   │   └── validator.py        # route/citation/PII post-checks
+│   │   └── validator.py        # route/citation/PII post-checks, superseded values
 │   ├── tools/
 │   │   ├── registry.py         # the 5 tools, exact names/args
 │   │   ├── authz.py            # ALL leave-data permission decisions
@@ -105,18 +113,21 @@ veltrix-assistant/
 │   ├── data/
 │   │   ├── db.py               # connections, transactions, migrations
 │   │   ├── employees.py        # repository; never selects phone
+│   │   ├── holidays.py         # holiday lookups per region
 │   │   ├── leave.py            # balances, requests
 │   │   └── sessions.py         # session ownership, history, proposal
 │   ├── llm/
-│   │   ├── client.py           # LLMClient: corpus-token guard, logging, retries
-│   │   └── providers/          # anthropic.py, openai.py
+│   │   ├── client.py           # LLMClient + providers: corpus-token guard, logging, repair, retries, hedging
+│   │   ├── embeddings.py       # local fastembed bge-small
+│   │   └── vision.py           # vision OCR model
 │   └── privacy/
 │       ├── masking.py          # email mask, phone strip
 │       └── log_filter.py       # PII redaction filter for all loggers
-├── eval/                       # eval harness: cases.yaml, run_eval.py, report
+├── eval/                       # eval harness: cases.yaml, run_eval.py, report, HISTORY.md
+├── scripts/                    # check_must_pass.py, make_dev_db.py, …
 ├── tests/                      # unit/, integration/, adversarial/
 ├── Dockerfile · docker-compose.yml · .env.example · Makefile
-├── README.md · DESIGN.md · ARCHITECTURE.md
+├── README.md · DESIGN.md · docs/ (this file and the decision notes)
 └── data/                       # mounted; replaced by reviewers
 ```
 
@@ -136,9 +147,8 @@ flowchart TD
     E --> F
     F --> G[Injection scan → flag blocks]
     G --> H[Chunker\nsection-aware, tables intact]
-    H --> I[Near-duplicate clustering]
-    I --> J[Embed + BM25 index]
-    H --> K[Fact extraction LLM\n→ policy_facts]
+    H --> J[Embed + BM25 index]
+    H --> K[Fact extraction LLM\n→ facts → rule keys\nclustering + LLM judge]
     F --> L[Calendar tables → holidays]
     J & K & L --> M[Persist + content-hash cache]
     M --> N[Integrity report → ready flag]
@@ -162,9 +172,9 @@ The **locator** for citations = deepest heading in `heading_path`, else `p. N`.
 
 ### 5.4 Chunking
 - Boundaries follow sections (headings); target ~350 tokens, max 500, small overlap only inside long sections.
-- Each chunk carries manifest metadata: `doc_id, doc_type, regions, effective_date, access_level, locator, dup_cluster, suspicious`.
+- Each chunk carries its locator, heading path, page, OCR engine and flags (`low_confidence`, `suspicious`); manifest metadata (`doc_type, regions, effective_date, access_level`) is attached from the manifest at every startup.
 - Rationale: section-aligned chunks give precise locators and keep a rule with its conditions; small chunks let several sources fit in the 3,000-token budget.
-- **Near-duplicates** (`dedup.py`): chunks are clustered by MinHash / embedding cosine (≈ 0.95+) into `dup_cluster`. A cluster only marks *candidates* for collapsing — chunks are true duplicates **only if their extracted facts are identical** (same rule keys, same values). Text-similar chunks with any differing value (e.g. policy v1 vs v2) are **versions**, not duplicates, and stay separate.
+- **Near-duplicates: planned, not built.** The plan was to collapse chunks whose extracted facts are identical (`dedup.py`). With ~30 documents it wasn't needed: versions with different values must stay separate for precedence anyway, and the rule table already shows one row per rule. At scale it would be MinHash LSH (§17).
 
 ### 5.5 Fact extraction (the core senior piece)
 The spec's hardest requirement is recognising when two documents state *"the same rule"*. Done at ingestion, once:
@@ -174,8 +184,8 @@ The spec's hardest requirement is recognising when two documents state *"the sam
   e.g. `topic="sick leave", attribute="annual allowance", value=12, unit="days"`.
 - **Values stated, not derived**: "1.5 days per month" stays `1.5`, unit `days/month`; any arithmetic happens later in code.
 - **Quote verification**: `quote_span` must exist in the chunk (exact match after light normalization — whitespace, quotes, dashes, case, table pipes) **and** contain the fact's value. Failing facts are dropped and counted by reason in the ingestion report; the chunk stays retrievable, so only the precedence aid is lost.
-- **Canonicalization**: facts are first **partitioned by `(unit, conditions)`** — hard constraints applied before clustering, so incompatible facts can never merge (L1–L3 vs L4+ are different rules). Within each partition, fact keys (`topic + attribute`) are embedded (local bge-small) and clustered hierarchically with average linkage on cosine distance (`rule_keys.py::average_linkage_labels`, numpy — scipy was blocked on the dev machine, see DECISIONS_QA) at a **conservative** threshold (default 0.12, measured), with **same-document cannot-link** (a document states each rule once) (no single linkage — it chains unrelated rules; complete linkage as fallback) into a canonical `rule_key`. Agglomerative rather than k-means/DBSCAN/HDBSCAN: the number of rules is unknown, many groups are just two versions, and chaining must be avoided. **Values are never part of the key** — the same rule with different values must land together so conflicts surface. Region, date and doc type are excluded too (precedence handles them). Fixed input order → reproducible. Learned from the corpus — no hand-written taxonomy, so the modified corpus works.
-- **Over-merging is worse than under-merging** (wrong silent winner vs a missed conflict the composer can still flag) → threshold kept conservative and not tuned tightly to our corpus. Optional: near-threshold pairs get a bounded, cached LLM yes/no check, counted in the token budget.
+- **Canonicalization**: the plan partitioned facts by `(unit, conditions)` first; the eval showed that split real rules (the accrual schedule wrote the service tier as a condition, v3 in the topic; a unit partition let an outdated FAQ "win" alone), so conditions are now part of the compared key text and hard **cannot-links** keep incompatible facts apart: same document, different numbers in the key (L1–L3 vs L4+), recommendation vs entitlement. Fact keys (`topic: attribute (conditions)`) are embedded (local bge-small) and clustered hierarchically with average linkage on cosine distance (`rule_keys.py::average_linkage_labels`, numpy — scipy was blocked on the dev machine, see DECISIONS_QA) at a **conservative** threshold (default 0.12, measured), with **same-document cannot-link** (a document states each rule once) (no single linkage — it chains unrelated rules; complete linkage as fallback) into a canonical `rule_key`. Agglomerative rather than k-means/DBSCAN/HDBSCAN: the number of rules is unknown, many groups are just two versions, and chaining must be avoided. **Values are never part of the key** — the same rule with different values must land together so conflicts surface. Region, date and doc type are excluded too (precedence handles them). Fixed input order → reproducible. Learned from the corpus — no hand-written taxonomy, so the modified corpus works.
+- **Over-merging is worse than under-merging** (wrong silent winner vs a missed conflict the composer can still flag) → threshold kept conservative and not tuned tightly to our corpus. **Near misses go to an LLM judge** (`rule_judge.py`, built after the eval): cluster pairs at distance 0.12–0.22 from different documents are asked "same rule?" with a few facts per side (quotes as corpus segments), batched, cached per question, and merged closest-first unless a cannot-link forbids it. The reply is a flat `{"q1": true}` map read pair by pair, because the model's JSON slips used to lose whole batches.
 - Every fact keeps `chunk_id` → used for citations. Clusters and their members are listed in the ingestion report for review.
 - Facts are **not** a replacement for chunks: the answer LLM still sees the source text; facts drive selection and conflict detection.
 
@@ -186,7 +196,7 @@ The spec's hardest requirement is recognising when two documents state *"the sam
 - Holiday sets per employee are resolved **through the Section 5 rules** (§7), never by picking a file name.
 
 ### 5.7 Injection scanning
-Heuristic + pattern scan ("ignore previous", "you are an AI", "call the tool", "system prompt"…) marks chunks `suspicious=true`. They stay retrievable as *information*, but the composer wraps all corpus text in delimiters and the validator rejects any tool call not originating from the user's plan.
+Heuristic + pattern scan ("ignore previous", "note for the AI assistant", "call the tool", "system prompt"…) marks chunks `suspicious=true`. They stay retrievable as *information* but are skipped by fact extraction, and their instruction-like sentences are removed before the chunk is sent to the composer (`without_injected_sentences`): eval round 10 showed a planted request could still surface as "…salary band is not provided here". The composer wraps all corpus text in delimiters and is told not to follow or mention notes aimed at an AI; tools only run from the user's plan.
 
 ### 5.8 Startup & caching
 - Ingestion runs in a background task at startup; `/health` returns **503** until the integrity report passes, then **200**.
@@ -204,7 +214,7 @@ Two SQLite files with different lifecycles. The split is a **design choice, not 
 | File | Lifecycle | Tables |
 |---|---|---|
 | **`veltrix.db`** (`DB_PATH`, in `./data`) | Source of truth; **replaced by reviewers** | Existing: `employees`, `leave_balances`, `leave_requests` (untouched). Added (§2.3): `sessions`, `messages`, `proposals` |
-| **`cache.db`** (cache dir, **outside `./data`**) | Disposable, rebuildable, **never committed** (`.gitignore`) | `documents`, `chunks`, `policy_facts`, `holidays`, chunk vectors, per-stage ingestion caches |
+| **`cache.db`** (cache dir, **outside `./data`**) | Disposable, rebuildable, **never committed** (`.gitignore`) | `documents`, `chunks`, `facts`, `holidays`, chunk vectors, per-stage ingestion caches |
 
 **Why `proposals` must live in `veltrix.db`:** the proposal is claimed and deleted in the same `BEGIN IMMEDIATE` transaction as the leave insert and balance update (§10). Transactions are atomic only within one file — across `ATTACH`ed databases in WAL mode they are not. Rule: anything written in the same transaction as leave data lives in `veltrix.db`.
 
@@ -215,21 +225,21 @@ Two SQLite files with different lifecycles. The split is a **design choice, not 
 ```mermaid
 erDiagram
     documents ||--o{ chunks : has
-    chunks ||--o{ policy_facts : yields
+    chunks ||--o{ facts : yields
     documents ||--o{ holidays : defines
     sessions ||--o{ messages : contains
     sessions ||--o| proposals : "≤ 1 pending"
 
     documents { text doc_id PK  text doc_type  text regions_json  text effective_date  text access_level  text content_hash }
-    chunks { text chunk_id PK  text doc_id FK  text locator  text text  int tokens  int dup_cluster  bool suspicious }
-    policy_facts { text fact_id PK  text chunk_id FK  text rule_key  text topic  text attribute  text value  text unit  text conditions  text quote_span }
+    chunks { text chunk_id PK  text doc_id FK  text locator  text text  int tokens  bool low_confidence  bool suspicious }
+    facts { text fact_id PK  text chunk_id FK  text rule_key  text topic  text attribute  text value  text unit  text conditions  text quote }
     holidays { text doc_id FK  text region  text date  text name }
     sessions { text session_id PK  text employee_id  text created_at }
     messages { text session_id FK  text role  text content  text created_at }
     proposals { text session_id PK  text employee_id  text tool_name  text args_json  text summary  text created_at }
 ```
 
-`documents`, `chunks`, `policy_facts`, `holidays` → `cache.db`; `sessions`, `messages`, `proposals` → `veltrix.db`. Existing tables are read and written only through `app/data/*` repositories.
+`documents`, `chunks`, `facts`, `holidays` → `cache.db`; `sessions`, `messages`, `proposals` → `veltrix.db`. Existing tables are read and written only through `app/data/*` repositories.
 
 ---
 
@@ -410,8 +420,9 @@ stateDiagram-v2
 ## 14. Reliability, determinism, observability
 
 - **Determinism**: temperature 0, fixed prompts, stable sort tie-breakers (doc_id), cached ingestion → identical results across the 3 test runs.
-- **Latency budget (30 s)**: planner ~3–5 s, retrieval < 100 ms, composer ~5–10 s; per-call timeouts with one retry; global deadline returns a safe fallback before 30 s.
-- **Malformed LLM output**: schema validation → one repair retry → safe fallback (`clarify` or `no_answer`, never a guessed answer).
+- **Latency budget (30 s)**: measured on `gpt-oss-20b` (NVIDIA): planner 2.1 s median / 4.3 s max, composer 1.8 s / 4.9 s, retrieval < 100 ms. Per-call timeouts (planner 12 s, composer 15 s) with one retry; a request deadline stops new calls from starting so the reply is a safe fallback, not a timeout.
+- **Provider stalls**: some calls hang for the full timeout. `LLMClient` sends a second identical call when the first hasn't answered after `hedge_after` (planner 5 s, composer 7 s) and takes the first reply, within the same cap. This doesn't help when the provider stalls on both.
+- **Malformed LLM output**: schema validation → one repair retry that names the invalid fields (never the rejected values) → safe fallback (`clarify` or `no_answer`, never a guessed answer). Known planner slips are corrected in code instead of being rejected: an unknown write action becomes "keep the pending one", `"intent": "many_employees"` with the flag set is a lookup, a booking with nothing to book and a policy query is answered as a question.
 - **Logs per request**: `request_id, session_id, employee_id, route, tool_calls[status], llm_calls[{purpose, model, corpus_tokens, total_tokens, latency_ms}]`.
 - **Not logged**: raw user messages and answers (they can contain names) unless redacted first, and full DB rows. Exceptions are logged with IDs only, so tracebacks can't dump personal data.
 - **Ingestion report**: per-doc parser/OCR engine, chunk count, fact count, holiday rows, warnings — surfaced in logs and used to gate `/health`.
@@ -425,21 +436,21 @@ stateDiagram-v2
 | `tests/unit/test_working_days.py` | weekends, holidays, ranges spanning both, single day, zero-day ranges, per-region calendars |
 | `tests/unit/test_precedence.py` | the spec's worked example verbatim + authority/scope/recency/conflict/upcoming edge cases |
 | `tests/unit/test_authz.py` | each role × each tool × self/report/other/non-existent; identical refusal |
-| `tests/unit/test_eligibility.py` | each role × access level, region, effective date |
-| `tests/unit/test_leave_rules.py` | every apply/cancel rejection reason, transaction atomicity |
-| `tests/integration/test_chat.py` | HTTP contract, 400/401/403, propose→confirm, modify, discard, route invariants (LLM stubbed for determinism + a live-LLM marker) |
+| `tests/unit/test_precedence.py`, `tests/integration/test_retrieval.py` | eligibility: each role × access level, region, effective date; restricted chunks never searched |
+| `tests/unit/test_leave_rules.py`, `test_tools.py` | every apply/cancel rejection reason; concurrent applies can't overdraw, cancels refund once |
+| `tests/integration/test_chat.py`, `test_leave_flow.py`, `test_api_contract.py` | HTTP contract, 400/401/403, propose→confirm, modify, discard, route invariants (LLM scripted for determinism) |
 | `tests/adversarial/` | doc injection, role/region claims, bulk requests, existence probing, session hijack, system-prompt extraction, "don't confirm" |
-| `tests/test_budget.py` | property test: no LLM call ever exceeds 3,000 corpus tokens |
-| `tests/test_modified_corpus.py` | mutate a value in a fixture doc → re-ingest → answer changes |
-| `eval/run_eval.py` (`make eval`) | question set → scorecard: route accuracy, citation precision/recall, key-fact accuracy, refusal correctness, run 3× for consistency |
+| `tests/unit/test_context_packer.py`, `test_llm_client.py` | the 3,000-token budget is filled and enforced; calls over it are refused |
+| `scripts/check_must_pass.py` | the five §12.1 checks against the real model, including a modified corpus (a value changed in a copy → the answer changes) |
+| `eval/run_eval.py` (`make eval`) | 53 cases × 3 runs → scorecard: route accuracy, citation precision/recall, key facts, forbidden content, tool calls, consistency, latency (`eval/HISTORY.md`) |
 
 ---
 
 ## 16. Deployment
 
 - `Dockerfile`: `python:3.11-slim` + `tesseract-ocr`; embedding model **and the tiktoken `cl100k_base` encoding** downloaded at **build time**, with `TIKTOKEN_CACHE_DIR` set (no network download at startup).
-- `docker-compose.yml`: single `app` service, port `8000:8000`, volume `./data:/app/data`, `env_file: .env`, healthcheck on `/health`.
-- `.env.example`: `CORPUS_DIR=./data/corpus`, `MANIFEST_PATH=./data/manifest.json`, `DB_PATH=./data/veltrix.db`, `APP_TODAY=`, `LLM_PROVIDER=anthropic`, `ANTHROPIC_API_KEY=`, `OPENAI_API_KEY=`, `LLM_MODEL=` (pin a dated model ID), `EMBEDDING_PROVIDER=local` (`local` = fastembed, `openai` optional), `LOG_LEVEL=INFO`, `LOG_FORMAT=json` (`text` for local reading), `RULE_CLUSTER_THRESHOLD=` (rule-key clustering distance; default set after measuring on the corpus).
+- `docker-compose.yml`: single `app` service, port `8000:8000`, volume `./data:/app/data`, a named volume for the ingestion cache, optional `env_file: .env`; `TESSERACT_CMD` cleared so a host path in `.env` doesn't override the image's Tesseract. Cold start measured at 240 s with an empty cache.
+- `.env.example`: every variable with defaults pointing at `./data` (`CORPUS_DIR`, `MANIFEST_PATH`, `DB_PATH`, `APP_TODAY`), `LLM_PROVIDER` / `LLM_MODEL` and one key variable per provider (OpenAI, Anthropic, Google, NVIDIA, OpenRouter, Mistral), concurrency, timeout and reasoning effort, the vision model, `EMBEDDING_PROVIDER=local`, `RULE_CLUSTER_THRESHOLD` and logging.
 - Ingestion artifacts written to a separate cache dir (not inside `./data`, which reviewers replace).
 
 ---
@@ -451,16 +462,18 @@ stateDiagram-v2
 | **Ingestion time** | Per-chunk LLM fact extraction ≈ 10⁵ calls; 10-min startup impossible | Ingestion as an offline/incremental job (content-hash cache), batch extraction, cheaper model for extraction, serve while indexing new docs |
 | **Fact canonicalization** | Clustering all fact keys is O(n²) | ANN-based clustering, hierarchical topic keys, incremental assignment to existing clusters |
 | **Context budget** | More versions/addenda per rule → winners + conflicts + upcoming no longer fit 3,000 tokens | Resolve precedence on facts *before* retrieval and send only winning + conflicting spans (quote-level, not chunk-level) |
-| **Vector search & filtering** | Exact numpy search + ID allow-lists get slow and memory-heavy (~50k chunks is still ~10 ms; ~1M is not) | Qdrant/pgvector with payload indexes on access_level/region/effective_date |
+| **Vector search & filtering** | Exact `IndexFlatIP` search + ID allow-lists get slow and memory-heavy (~50k chunks is still ~10 ms; ~1M is not) | FAISS IVF/HNSW, or Qdrant/pgvector with payload indexes on access_level/region/effective_date |
+| **Rule judge** | Near-miss pairs grow with the number of rules | Judge only pairs within one topic cluster; a document lineage link ("replaces v1") so versions are compared without similarity guesses |
 | **Near-duplicates** | Pairwise comparison explodes | MinHash LSH |
 | **Single SQLite writer** | Concurrent leave writes | Postgres with row-level locking |
 
 ---
 
-## 18. Open items (⚠ validate with the real corpus)
+## 18. Open items from the blueprint: how they were resolved
 
-- Exact table layouts in the holiday calendars and accrual docs.
-- Which document is scanned and its quality (OCR engine choice).
-- Real distribution of conflicts (FAQ vs policy, regional addenda) → tune fact canonicalization threshold.
-- Model choice per call (planner vs composer vs extraction) after measuring latency.
-- Shape of injection text in the corpus → extend the scan patterns and adversarial tests.
+- **Table layouts** (holiday calendars, accrual schedule): parsed generically from the block model; "restricted" holidays are read from section headings.
+- **The scanned document** (the hybrid-work memo): vision OCR with a Tesseract number cross-check; the memo is ingested, extracted and wins for India WFH (3 days).
+- **Conflict distribution** → rule-key threshold 0.12, measured on the corpus, plus the LLM judge for near misses (§5.5). Remaining over- and under-merges are listed in DESIGN.md §6.
+- **Model per call:** one model for all calls (`LLM_MODEL`), `LLM_REASONING_EFFORT=low` to fit the 10-minute ingestion; the vision model is separate (`VISION_MODEL`).
+- **Injection text in the corpus:** a wiki note addressed to "the AI assistant" asking for the manager's salary band; covered by the scan patterns, the adversarial tests and the `injection-in-wiki` eval case.
+- **Still open** (README → Known limitations): small-model variance between runs, provider stalls, and the rule-grouping cases above.
