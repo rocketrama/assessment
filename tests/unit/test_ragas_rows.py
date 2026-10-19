@@ -5,7 +5,7 @@ from pathlib import Path
 
 import yaml
 
-from eval.ragas_eval import build_rows
+from eval.ragas_eval import build_rows, is_scored, row_key
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -53,3 +53,12 @@ def test_every_document_case_has_a_reference_answer():
         if set(t.get("route", [])) & {"rag", "hybrid"} and not t.get("reference")
     ]
     assert missing == []
+
+
+def test_checkpoint_key_changes_with_the_answer_and_partial_scores_are_rescored():
+    (row,), _ = build_rows([result()], {1})
+    changed = {**row, "response": "You get 10 days."}
+    assert row_key(row) == row_key(dict(row)) and row_key(row) != row_key(changed)
+    assert not is_scored({**row, "faithfulness": 1.0})
+    assert is_scored({**row, "faithfulness": 1.0, "answer_relevancy": 0.9,
+                      "llm_context_precision_with_reference": 0.8, "context_recall": 1.0})

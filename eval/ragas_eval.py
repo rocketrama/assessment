@@ -28,10 +28,15 @@ it is still wrong. Version, region and access correctness stay with the checks.
 Each judge call carries at most the contexts the composer got, so at most 3,000
 corpus tokens (TASK.pdf §4.3); turns above that are skipped, never truncated.
 
+Turns are scored a few at a time and saved to eval/.ragas_checkpoint.json after each
+batch, so an interrupted run resumes where it stopped (a run on the free tier takes
+about an hour). A turn whose judge call failed is retried on the next run.
+
 Writes eval/ragas_report.md and eval/ragas_results.json.
 """
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -43,6 +48,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RESULTS_PATH = ROOT / "eval" / "results.json"
 REPORT_PATH = ROOT / "eval" / "ragas_report.md"
 SCORES_PATH = ROOT / "eval" / "ragas_results.json"
+CHECKPOINT_PATH = ROOT / "eval" / ".ragas_checkpoint.json"
+BATCH_TURNS = 4
 CORPUS_TOKEN_LIMIT = 3000
 DOC_ROUTES = {"rag", "hybrid"}
 # Column names RAGAS gives the four metrics, and how the report names them.
@@ -142,7 +149,17 @@ def local_embeddings():
     return FastEmbed()
 
 
-def score(rows: list[dict], workers: int) -> tuple[list[dict], str]:
+def row_key(row: dict) -> str:
+    """Identifies a scored turn; changes when its answer, contexts or reference change."""
+    content = json.dumps([row["response"], row["retrieved_contexts"], row["reference"]], ensure_ascii=False)
+    return f"{row['run']}|{row['case']}|{row['turn']}|{hashlib.sha1(content.encode()).hexdigest()[:12]}"
+
+
+def is_scored(row: dict) -> bool:
+    return all(row.get(column) is not None for column in METRICS)
+
+
+def score(rows: list[dict], workers: int, llm, embeddings) -> list[dict]:
     import warnings
 
     warnings.filterwarnings("ignore", category=DeprecationWarning)
@@ -150,14 +167,13 @@ def score(rows: list[dict], workers: int) -> tuple[list[dict], str]:
     from ragas.metrics import Faithfulness, LLMContextPrecisionWithReference, LLMContextRecall, ResponseRelevancy
     from ragas.run_config import RunConfig
 
-    llm, judge = judge_llm()
     dataset = EvaluationDataset.from_list(
         [{k: row[k] for k in ("user_input", "response", "retrieved_contexts", "reference")} for row in rows]
     )
     # strictness=1: one generated question per answer (some OpenAI-compatible endpoints ignore n > 1)
     metrics = [Faithfulness(), ResponseRelevancy(strictness=1), LLMContextPrecisionWithReference(), LLMContextRecall()]
     result = evaluate(
-        dataset, metrics=metrics, llm=llm, embeddings=local_embeddings(),
+        dataset, metrics=metrics, llm=llm, embeddings=embeddings,
         # Context precision makes one judge call per context (10-20 per turn): 600 s per metric and turn.
         run_config=RunConfig(timeout=600, max_retries=3, max_workers=workers), raise_exceptions=False,
     )
@@ -166,6 +182,29 @@ def score(rows: list[dict], workers: int) -> tuple[list[dict], str]:
         for column in METRICS:
             value = scores.get(column)
             row[column] = None if value is None or (isinstance(value, float) and math.isnan(value)) else float(value)
+    return rows
+
+
+def score_resumable(rows: list[dict], workers: int) -> tuple[list[dict], str]:
+    """Score in batches of BATCH_TURNS, saving each batch; turns already fully scored
+    in the checkpoint are reused."""
+    try:
+        saved = json.loads(CHECKPOINT_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    for row in rows:
+        if is_scored(done := saved.get(row_key(row), {})):
+            row.update({column: done[column] for column in METRICS})
+    todo = [row for row in rows if not is_scored(row)]
+    llm, judge = judge_llm()
+    if todo:
+        print(f"{len(rows) - len(todo)} turns already scored (checkpoint); scoring {len(todo)}", flush=True)
+        embeddings = local_embeddings()
+        for start in range(0, len(todo), BATCH_TURNS):
+            batch = score(todo[start:start + BATCH_TURNS], workers, llm, embeddings)
+            saved.update({row_key(row): {column: row[column] for column in METRICS} for row in batch})
+            CHECKPOINT_PATH.write_text(json.dumps(saved, indent=1), encoding="utf-8")
+            print(f"saved {min(start + BATCH_TURNS, len(todo))}/{len(todo)}", flush=True)
     return rows, judge
 
 
@@ -235,7 +274,7 @@ def main() -> None:
     if not rows:
         sys.exit(f"Nothing to score (left out: {skipped}).")
     print(f"scoring {len(rows)} turns with RAGAS ({len(METRICS)} metrics)...", flush=True)
-    rows, judge = score(rows, args.workers)
+    rows, judge = score_resumable(rows, args.workers)
     REPORT_PATH.write_text(write_report(rows, skipped, judge, runs), encoding="utf-8")
     SCORES_PATH.write_text(json.dumps(rows, indent=1, ensure_ascii=False), encoding="utf-8")
     for column, name in METRICS.items():

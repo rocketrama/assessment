@@ -31,3 +31,6 @@ Thumbs.db
 .idea/
 *.png
 !docs/*.png
+
+# RAGAS progress between interrupted runs (eval/ragas_eval.py)
+eval/.ragas_checkpoint.json
