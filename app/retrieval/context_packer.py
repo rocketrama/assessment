@@ -1,7 +1,7 @@
 """Token-budgeted context for the answer call (TASK.pdf §4.3, must-pass #4).
 
-Chunks arrive in priority order (winning passages, conflicting ones, upcoming
-ones, then other relevant context) and are added while they fit in
+Chunks arrive in priority order (search-rank order, each hit preceded by the
+winning, conflicting and upcoming passages of its rules) and are added while they fit in
 CORPUS_TOKEN_LIMIT cl100k tokens. A chunk that doesn't fit is skipped and the
 next, smaller one is still tried. llm/client.py recounts and refuses anything
 over the limit, so the budget is enforced twice. A chunk flagged by the injection

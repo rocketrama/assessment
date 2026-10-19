@@ -101,25 +101,39 @@ class SearchIndex:
                 dense[position[int(row)]] = score
         return dense
 
-    def search(self, query: str, allowed_ids: Collection[str], k: int = 10) -> list[SearchHit]:
+    def _ranks(self, query: str, rows: np.ndarray, ids: list[str]) -> tuple[dict[int, int], dict[int, int]]:
+        """1-based BM25 and dense ranks of each row position for one query."""
+        bm25 = self._bm25(tokenize(query), rows)
+        bm25_order = sorted((i for i in range(len(rows)) if bm25[i] > 0), key=lambda i: (-bm25[i], ids[i]))
+        dense = self._dense_scores(query, rows)
+        dense_order = sorted(range(len(rows)), key=lambda i: (-float(dense[i]), ids[i]))
+        return (
+            {i: rank for rank, i in enumerate(bm25_order, start=1)},
+            {i: rank for rank, i in enumerate(dense_order, start=1)},
+        )
+
+    def search(
+        self, query: str, allowed_ids: Collection[str], k: int = 10, also: str | None = None, also_weight: float = 0.5
+    ) -> list[SearchHit]:
+        """`also`: a second query (the employee's own words when `query` is the planner's
+        rewrite), fused in at `also_weight`. Hit ranks reported are those of `query`."""
         rows = np.array(sorted(self._row[c] for c in allowed_ids if c in self._row), dtype=np.int64)
         if not len(rows):
             return []
         ids = [self._ids[r] for r in rows]
 
-        bm25 = self._bm25(tokenize(query), rows)
-        bm25_order = sorted((i for i in range(len(rows)) if bm25[i] > 0), key=lambda i: (-bm25[i], ids[i]))
-        bm25_rank = {i: rank for rank, i in enumerate(bm25_order, start=1)}
-
-        dense = self._dense_scores(query, rows)
-        dense_order = sorted(range(len(rows)), key=lambda i: (-float(dense[i]), ids[i]))
-        dense_rank = {i: rank for rank, i in enumerate(dense_order, start=1)}
+        runs = [(1.0, *self._ranks(query, rows, ids))]
+        if also and also.strip() and also.strip() != query.strip():
+            runs.append((also_weight, *self._ranks(also, rows, ids)))
+        bm25_rank, dense_rank = runs[0][1], runs[0][2]
 
         fused = []
         for i in range(len(rows)):
-            score = DENSE_WEIGHT / (RRF_K + dense_rank[i])
-            if i in bm25_rank:
-                score += BM25_WEIGHT / (RRF_K + bm25_rank[i])
+            score = 0.0
+            for weight, bm25_ranks, dense_ranks in runs:
+                score += weight * DENSE_WEIGHT / (RRF_K + dense_ranks[i])
+                if i in bm25_ranks:
+                    score += weight * BM25_WEIGHT / (RRF_K + bm25_ranks[i])
             fused.append(SearchHit(ids[i], score, bm25_rank.get(i), dense_rank[i]))
         fused.sort(key=lambda h: (-h.score, h.chunk_id))
         return fused[:k]

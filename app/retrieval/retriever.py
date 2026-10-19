@@ -6,9 +6,14 @@
 2. Hybrid search (index.py) over that set.
 3. Every rule touched by a hit is resolved across *all* its facts (§5.1) — so
    the winning policy is found even when only an outdated FAQ matched the words.
-4. Context in priority order: winning passages (both sides of a conflict),
-   upcoming-change passages, then other hits. Passages whose facts all lost
-   are left out, so an outdated source can't be cited (§4.2).
+4. Context in hit-rank order: at each hit, first the winning passages (both
+   sides of a conflict) and upcoming-change passages of the rules that hit
+   raised, then the hit itself. Passages whose facts all lost are left out, so
+   an outdated source can't be cited (§4.2). RAGAS finding: with every rule's
+   winners put first, the 8th hit's rules (remote work, carry forward) filled
+   the context ahead of the 1st hit, the holiday calendar that answered the
+   question (context precision 0.06-0.11), and pushed the manager handbook out
+   of the budget for "how quickly must I respond to a leave request".
 5. A passage that names another document by its manifest title ("according to
    the Annual Leave Accrual Schedule") brings that document's passages in right
    after it, within the requester's eligible set and a token cap. Eval finding:
@@ -85,9 +90,14 @@ class Retriever:
         reference_date: date,
         today: date | None = None,
         k: int = DEFAULT_TOP_K,
+        message: str | None = None,
     ) -> RetrievalResult:
         """`reference_date` is today unless the question is about a past date (§5);
-        upcoming changes are only announced for questions about today."""
+        upcoming changes are only announced for questions about today.
+        `message`: the employee's own words when `query` is the planner's rewrite;
+        searched too, at half weight. RAGAS finding: "how quickly must I respond to a
+        leave request from my team?" ranks the manager handbook 2nd, the planner's
+        "response time for manager on leave requests" only 5th to beyond the top 10."""
         corpus, role, region = self.corpus, requester.role, requester.region
         include_upcoming = reference_date >= (today or reference_date)
         allowed = allowed_chunk_ids(self._chunk_docs, corpus.docs, role, region, reference_date)
@@ -97,7 +107,7 @@ class Retriever:
             else frozenset()
         )
 
-        hits = self.index.search(query, allowed | upcoming, k=k)
+        hits = self.index.search(query, allowed | upcoming, k=k, also=message)
         current_hits = tuple(h for h in hits if h.chunk_id in allowed)
 
         rule_keys: list[str] = []
@@ -110,7 +120,7 @@ class Retriever:
             for key in rule_keys
             if (r := resolve(key, corpus.facts_by_rule[key], corpus.docs, role, region, reference_date, include_upcoming))
         )
-        ordered = self._context_order(current_hits, resolutions, allowed, upcoming)
+        ordered = self._context_order(hits, resolutions, allowed, upcoming)
         ordered = self._with_linked_docs(
             query, ordered, {h.chunk_id for h in current_hits}, allowed, role, region, reference_date
         )
@@ -125,20 +135,29 @@ class Retriever:
         allowed: frozenset[str],
         upcoming: frozenset[str],
     ) -> list[str]:
-        winning = [f.chunk_id for r in resolutions for f in r.winners]
-        coming = [f.chunk_id for r in resolutions for f in r.upcoming]
+        """`hits` include upcoming-only hits: they place their rules' passages but are
+        not added themselves (an upcoming passage enters only as a rule's upcoming fact)."""
+        pending = {r.rule_key: r for r in resolutions}
         lost_facts = {f.fact_id for r in resolutions for f in r.outranked}
-        others = []
+        ordered: list[str] = []
+        current: list[str] = []
+        coming: list[str] = []
         for hit in hits:
             facts = self.corpus.facts_by_chunk.get(hit.chunk_id, [])
+            for fact in facts:
+                if (r := pending.pop(fact.rule_key, None)) is not None:
+                    winning = [f.chunk_id for f in r.winners]
+                    ordered += winning + [f.chunk_id for f in r.upcoming]
+                    current += winning
+                    coming += [f.chunk_id for f in r.upcoming]
             # A chunk whose every fact lost precedence must not be cited (§5.1).
-            if facts and all(f.fact_id in lost_facts for f in facts):
+            if hit.chunk_id not in allowed or (facts and all(f.fact_id in lost_facts for f in facts)):
                 continue
-            others.append(hit.chunk_id)
-        ordered = winning + coming + others
+            ordered.append(hit.chunk_id)
+            current.append(hit.chunk_id)
         # Defence in depth (not `assert`, which -O strips): nothing outside the
         # eligible set reaches the context, except upcoming-change passages.
-        if any(c not in allowed for c in winning + others) or any(c not in upcoming for c in coming):
+        if any(c not in allowed for c in current) or any(c not in upcoming for c in coming):
             raise RuntimeError("context contains a chunk the requester may not use")
         return ordered
 

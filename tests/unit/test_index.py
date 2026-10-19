@@ -104,3 +104,14 @@ def test_misaligned_inputs_rejected():
 
     with pytest.raises(ValueError):
         SearchIndex(["a"], ["x", "y"], np.zeros((1, 384), dtype=np.float32), HashingEmbedder())
+
+
+def test_a_second_query_is_fused_in_and_an_identical_one_changes_nothing():
+    index = make_index()
+    assert index.search("carry forward days", TEXTS.keys())[0].chunk_id == "POL::001"
+    assert index.search("carry forward days", TEXTS.keys(), also="carry forward days") == index.search(
+        "carry forward days", TEXTS.keys()
+    )
+    fused = index.search("carry forward days", TEXTS.keys(), also="Deepavali", also_weight=10)
+    assert fused[0].chunk_id == "CAL::000"
+    assert fused[0].bm25_rank is None  # ranks reported are the main query's

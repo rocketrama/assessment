@@ -334,7 +334,9 @@ def handle_turn(turn: Turn, request_id: str) -> TurnResult:
     retrieval, segments, sent_ids, reference = None, [], [], turn.today
     if wants_docs and turn.retriever is not None:
         reference = resolve_reference_date(plan.about_date, turn.today) or turn.today
-        retrieval = turn.retriever.retrieve(plan.policy_query or turn.message, turn.requester, reference, today=turn.today)
+        retrieval = turn.retriever.retrieve(
+            plan.policy_query or turn.message, turn.requester, reference, today=turn.today, message=turn.message
+        )
         segments, packed = build_corpus_input(retrieval, turn.retriever.corpus)
         sent_ids = list(packed.chunk_ids) if packed else []
 

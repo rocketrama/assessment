@@ -8,7 +8,8 @@ Usage:
 Each run starts the app on a fresh copy of ./data (leave writes change the DB)
 and a copy of ./cache (warm start), so ./data and ./cache are never changed.
 Writes eval/report.md (scorecard, consistency, every failure with its reason)
-and eval/results.json (raw responses).
+and eval/results.json (raw responses, plus what the composer was given per turn
+and the case's reference answer, for the RAGAS scores in eval/ragas_eval.py).
 """
 
 import argparse
@@ -32,6 +33,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
+from app.orchestration import orchestrator  # noqa: E402
 
 CASES_PATH = ROOT / "eval" / "cases.yaml"
 REPORT_PATH = ROOT / "eval" / "report.md"
@@ -108,6 +110,37 @@ def make_settings(work: Path, base: Settings) -> Settings:
     })
 
 
+class ComposerInputs:
+    """What the composer was given for the current turn: the corpus passages, tool
+    results and notes. Saved per turn as RAGAS's `retrieved_contexts` (eval/ragas_eval.py)."""
+
+    def __init__(self) -> None:
+        self.contexts: list[dict] = []
+        self._compose = orchestrator.compose
+
+    def __enter__(self) -> "ComposerInputs":
+        def compose(llm, message, requester, today, reference_date, segments, tool_results, notes, *a, **k):
+            if self.contexts:  # a rewrite pass: same passages, plus an instruction that isn't context
+                return self._compose(llm, message, requester, today, reference_date, segments, tool_results, notes, *a, **k)
+            # The requester details the composer is given (level, join date, region): RAGAS's
+            # judge needs them too, or "your notice period is 30 days" (L1-L3) looks unsupported.
+            about = {"today": today.isoformat(), "employee_id": requester.employee_id, "role": requester.role,
+                     "region": requester.region, "level": requester.level, "join_date": requester.join_date}
+            if reference_date and reference_date != today:
+                about["question_is_about_date"] = reference_date.isoformat()
+            self.contexts = [{"id": "requester", "kind": "requester", "text": "Requester: " + json.dumps(about)}]
+            self.contexts += [{"id": s.chunk_id, "kind": "corpus", "text": s.text} for s in segments]
+            self.contexts += [{"id": f"tool:{t['tool']}", "kind": "tool", "text": json.dumps(t, default=str)} for t in tool_results]
+            self.contexts += [{"id": "note", "kind": "note", "text": n} for n in notes]
+            return self._compose(llm, message, requester, today, reference_date, segments, tool_results, notes, *a, **k)
+
+        orchestrator.compose = compose
+        return self
+
+    def __exit__(self, *exc) -> None:
+        orchestrator.compose = self._compose
+
+
 class NoAnswerReasons(logging.Handler):
     """Collects the orchestrator's "no_answer" log records (reason only, no text)."""
 
@@ -124,7 +157,7 @@ def run_once(cases: list[dict], base: Settings, run_no: int) -> list[dict]:
     work = Path(tempfile.mkdtemp(prefix=f"eval-run{run_no}-"))
     results = []
     try:
-        with TestClient(create_app(make_settings(work, base))) as client:
+        with TestClient(create_app(make_settings(work, base))) as client, ComposerInputs() as inputs:
             started = time.monotonic()
             while client.get("/health").status_code != 200:
                 if time.monotonic() - started > 600:
@@ -139,6 +172,7 @@ def run_once(cases: list[dict], base: Settings, run_no: int) -> list[dict]:
                 session = f"eval-{run_no}-{case['id']}-{time.time_ns()}"
                 for i, turn in enumerate(case["turns"]):
                     reasons.reasons.clear()
+                    inputs.contexts = []
                     t0 = time.monotonic()
                     resp = client.post("/chat", json={"session_id": session, "message": turn["say"]},
                                        headers={"X-Employee-Id": case["employee"]})
@@ -153,6 +187,7 @@ def run_once(cases: list[dict], base: Settings, run_no: int) -> list[dict]:
                         "checks": {k: ok for k, (ok, _) in scored["checks"].items()},
                         "precision": scored["precision"], "recall": scored["recall"],
                         "no_answer_reason": reasons.reasons[-1] if reasons.reasons else None,
+                        "reference": turn.get("reference"), "contexts": inputs.contexts,
                     })
                     print(f"run {run_no} {case['id']}[{i}] {'PASS' if results[-1]['ok'] else 'FAIL'} "
                           f"{body.get('route')} {seconds:.1f}s", flush=True)

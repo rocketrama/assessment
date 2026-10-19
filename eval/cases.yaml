@@ -13,6 +13,8 @@
 #   answer_lacks:  none of these may appear
 #   tool:          {name, status, args} — args is a subset to match
 #   pending:       expected pending_confirmation
+#   reference:     the correct answer, from the corpus text (RAGAS context recall and
+#                  context precision in eval/ragas_eval.py; not used by the checks above)
 #
 # Employees: E1001 IN employee (L2), E1002 US employee, E1003 DE employee,
 # E1004 IN employee (joined 2025-11-03), M2001 IN manager of E1001+E1002,
@@ -24,6 +26,7 @@
   employee: E1001
   turns:
     - say: How many sick days do I get?
+      reference: "Employees receive 12 working days of paid sick leave per leave year under Global Leave Policy Version 2."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_ok: [POL-LEAVE-GLOBAL-V3]
@@ -35,6 +38,7 @@
   employee: E1002
   turns:
     - say: How many paid sick days do I get per year?
+      reference: "Employees receive 12 working days of paid sick leave per leave year under Global Leave Policy Version 2."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_ok: [POL-LEAVE-GLOBAL-V3, ADD-LEAVE-US]
@@ -46,6 +50,7 @@
   employee: E1003
   turns:
     - say: How many sick days do I get?
+      reference: "Employees in Germany receive up to 30 working days of paid sick leave per leave year."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-DE]
       cite_none: [FAQ-LEAVE, POL-LEAVE-GLOBAL-V1]
@@ -56,6 +61,7 @@
   employee: E1001
   turns:
     - say: What was the sick leave allowance in 2025?
+      reference: "In 2025, under Global Leave Policy Version 1, the sick leave allowance was 10 working days per year."
       route: [rag]
       cite_all: [POL-LEAVE-GLOBAL-V1]
       cite_none: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY, POL-LEAVE-GLOBAL-V3]
@@ -67,6 +73,7 @@
   employee: E1001
   turns:
     - say: How many days of annual leave can I carry forward?
+      reference: "Employees in India may carry forward up to 15 days of unused annual leave into the next leave year."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-IN]
       cite_none: [FAQ-LEAVE, WIKI-LEAVE-HOWTO]
@@ -77,6 +84,7 @@
   employee: E1002
   turns:
     - say: How many days of annual leave can I carry forward?
+      reference: "Employees in the United States may carry forward up to 5 days of unused annual leave into the next leave year."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-US]
       cite_none: [FAQ-LEAVE, WIKI-LEAVE-HOWTO]
@@ -87,6 +95,7 @@
   employee: E1003
   turns:
     - say: How many days of annual leave can I carry forward?
+      reference: "Employees in Germany may carry forward up to 10 days of unused annual leave; carried forward days must be used by 31 March of the following year."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-DE]
       cite_none: [FAQ-LEAVE, WIKI-LEAVE-HOWTO]
@@ -97,6 +106,7 @@
   employee: E1001
   turns:
     - say: By when must I use the annual leave I carried forward?
+      reference: "Carried forward annual leave in India does not expire on a fixed date; the total annual leave balance may not exceed 45 days."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-IN]
       cite_none: [FAQ-LEAVE]
@@ -108,6 +118,7 @@
   employee: E1002
   turns:
     - say: By when must I use the annual leave I carried forward?
+      reference: "Carried forward days must be used by 31 March of the new leave year; days not used by then are forfeited."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY, ADD-LEAVE-US]
       cite_ok: [POL-LEAVE-GLOBAL-V3]
@@ -120,6 +131,7 @@
   employee: E1001
   turns:
     - say: When do I need a medical certificate for sick leave?
+      reference: "A medical certificate is required for any sick leave absence of more than 3 consecutive working days."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_none: [FAQ-LEAVE, POL-LEAVE-GLOBAL-V1]
@@ -130,6 +142,7 @@
   employee: E1002
   turns:
     - say: How many days of bereavement leave do I get?
+      reference: "Employees may take up to 5 working days of paid bereavement leave on the death of an immediate family member."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_none: [FAQ-LEAVE, POL-LEAVE-GLOBAL-V1]
@@ -140,6 +153,7 @@
   employee: E1002
   turns:
     - say: How long is paid parental leave for a primary caregiver?
+      reference: "A primary caregiver may take up to 20 weeks of paid parental leave following the birth or adoption of a child."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_ok: [ADD-LEAVE-US]
@@ -151,6 +165,7 @@
   employee: E1004
   turns:
     - say: How long is paid maternity leave for a birth mother?
+      reference: "In India a birth mother may take up to 26 weeks of paid maternity leave, of which up to 8 weeks may be taken before the expected date of delivery."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-IN]
       answer_has: ["26"]
@@ -160,6 +175,7 @@
   employee: E1001
   turns:
     - say: How many days a week can I work from home?
+      reference: "From 1 July 2026, employees in the Bengaluru office may work from home for up to 3 days per week."
       route: [rag, hybrid]
       cite_all: [MEMO-HYBRID-2026]
       cite_ok: [POL-REMOTE-WORK]
@@ -171,6 +187,7 @@
   employee: E1003
   turns:
     - say: How many days a week can I work from home?
+      reference: "Employees in Germany may work from home for up to 2 days per week; the hybrid work memo does not apply to the Berlin office."
       route: [rag, hybrid]
       cite_all: [POL-REMOTE-WORK]
       cite_ok: [FAQ-LEAVE]  # the FAQ agrees (2 days); citing a source used is allowed
@@ -182,6 +199,7 @@
   employee: E1001
   turns:
     - say: In March 2026, how many days a week could I work from home?
+      reference: "In March 2026, before the memo took effect on 1 July 2026, employees could work from home for up to 2 days per week."
       route: [rag, hybrid]
       cite_all: [POL-REMOTE-WORK]
       cite_none: [MEMO-HYBRID-2026]
@@ -192,6 +210,7 @@
   employee: E1002
   turns:
     - say: Do employees get wellbeing days?
+      reference: "Not yet: from 1 January 2027, Global Leave Policy Version 3 gives every employee 2 paid wellbeing days per leave year."
       route: [rag]
       cite_all: [POL-LEAVE-GLOBAL-V3]
       answer_has: ["2", "2027"]
@@ -201,6 +220,7 @@
   employee: E1001
   turns:
     - say: How many days of annual leave do I earn per month with 3 years of service?
+      reference: "With 2 to less than 5 years of service, annual leave is earned at 1.75 days per month (21 days a year); from 1 January 2027 this rises to 2.0 days per month."
       route: [rag, hybrid]
       cite_all: [TBL-LEAVE-ACCRUAL]
       cite_ok: [POL-LEAVE-GLOBAL-V3, ADD-LEAVE-IN]
@@ -211,6 +231,7 @@
   employee: E1003
   turns:
     - say: How many days of annual leave do I get per year?
+      reference: "Employees in Germany receive 30 working days of paid annual leave per leave year, earned at 2.5 days per month."
       route: [rag, hybrid]
       cite_all: [ADD-LEAVE-DE]
       answer_has: ["30"]
@@ -220,8 +241,9 @@
   employee: E1002
   turns:
     - say: Can I take half a day of annual leave?
+      reference: "No. Leave is taken in whole days."
       route: [rag]
-      answer_has: [["whole day", "whole days", "full day", "full days"]]
+      answer_has: [["whole day", "whole days", "whole working day", "full day", "full days", "full working day"]]
 
 # Worded differently from the documents: no shared keywords, so only vector search finds them.
 - id: paraphrase-sick
@@ -229,6 +251,7 @@
   employee: E1002
   turns:
     - say: Can I get time off when I'm unwell?
+      reference: "Yes. Employees receive 12 working days of paid sick leave per leave year."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_ok: [POL-LEAVE-GLOBAL-V3, ADD-LEAVE-US]
@@ -240,6 +263,7 @@
   employee: E1002
   turns:
     - say: My grandmother passed away, how long can I stay home?
+      reference: "You may take up to 5 working days of paid bereavement leave; a grandparent counts as immediate family."
       route: [rag, hybrid]
       cite_any: [POL-LEAVE-GLOBAL-V2, POL-LEAVE-GLOBAL-V2-SUMMARY]
       cite_none: [FAQ-LEAVE, POL-LEAVE-GLOBAL-V1]
@@ -250,6 +274,7 @@
   employee: E1003
   turns:
     - say: Can I do my job from my house?
+      reference: "Employees in Germany may work from home for up to 2 days per week."
       route: [rag, hybrid]
       cite_all: [POL-REMOTE-WORK]
       cite_ok: [FAQ-LEAVE]
@@ -261,6 +286,7 @@
   employee: E1001
   turns:
     - say: What is my notice period after probation?
+      reference: "After probation, the notice period for levels L1 to L3 is 30 days."
       route: [rag, hybrid]
       cite_all: [POL-PROBATION-NOTICE]
       answer_has: ["30"]
@@ -271,6 +297,7 @@
   employee: E1001
   turns:
     - say: When is Deepavali this year?
+      reference: "Deepavali is on 9 November 2026, a public holiday for the Bengaluru office."
       route: [rag]
       cite_all: [CAL-HOL-IN-2026]
       cite_none: [CAL-HOL-IN-2025]
@@ -281,6 +308,7 @@
   employee: E1002
   turns:
     - say: Is the day after Thanksgiving a holiday this year?
+      reference: "Yes. The day after Thanksgiving, Friday 27 November 2026, is a holiday for the Austin office."
       route: [rag]
       cite_all: [CAL-HOL-US-2026]
       answer_has: [["27 November", "November 27"]]
@@ -290,6 +318,7 @@
   employee: E1004
   turns:
     - say: Is the office closed on Holi?
+      reference: "No. Holi (4 March 2026) is a restricted (optional) holiday and the office stays open; employees in India may choose up to 2 restricted holidays a year."
       route: [rag]
       cite_any: [CAL-HOL-IN-2026, ADD-LEAVE-IN]
       answer_has: [["restricted", "optional"]]
@@ -300,6 +329,7 @@
   employee: M2001
   turns:
     - say: How quickly must I respond to a leave request from my team?
+      reference: "Managers must respond to every leave request from their team within 2 working days."
       route: [rag, hybrid]
       cite_all: [HB-MANAGER]
       answer_has: ["2 working days"]
@@ -335,6 +365,7 @@
   employee: H9001
   turns:
     - say: What is the salary band for level L3 in India?
+      reference: "The 2026 salary band for level L3 in India is 14,00,000 to 22,00,000 rupees per year."
       route: [rag]
       cite_all: [HR-COMP-BANDS-2026]
       answer_has: ["14,00,000"]
@@ -344,6 +375,7 @@
   employee: H9001
   turns:
     - say: How long does a performance improvement plan last?
+      reference: "A performance improvement plan normally lasts 60 calendar days and may be extended once by up to 30 calendar days."
       route: [rag]
       cite_all: [HR-PIP-GUIDE]
       answer_has: ["60"]
@@ -362,6 +394,7 @@
   employee: E1001
   turns:
     - say: What is my sick leave balance?
+      reference: "Your sick leave balance is 6 days."
       route: [tool, hybrid]
       tool: {name: get_leave_balance, status: success, args: {employee_id: E1001}}
       answer_has: ["6"]
@@ -371,6 +404,7 @@
   employee: M2001
   turns:
     - say: What is E1002's annual leave balance?
+      reference: "E1002's annual leave balance is 12 days."
       route: [tool, hybrid]
       tool: {name: get_leave_balance, status: success, args: {employee_id: E1002}}
       answer_has: ["12"]
@@ -405,6 +439,7 @@
   employee: E1004
   turns:
     - say: How many annual leave days will I have by the end of December?
+      reference: "E1004 has 12 days of annual leave now and earns 1.5 days per month, credited on the last day of each month; with 4 credits by 31 December 2026 the balance will be 18 days."
       route: [hybrid]
       cite_any: [TBL-LEAVE-ACCRUAL, ADD-LEAVE-IN]
       tool: {name: get_leave_balance, status: success}
