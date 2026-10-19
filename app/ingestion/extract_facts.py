@@ -40,7 +40,7 @@ from app.llm.client import CorpusSegment, LLMClient
 
 log = logging.getLogger("veltrix.ingestion")
 
-EXTRACT_VERSION = "12"
+EXTRACT_VERSION = "13"
 BATCH_CORPUS_TOKENS = 1200
 MAX_FACTS_PER_CALL = 80
 CALL_TIMEOUT_SECONDS = 90.0
@@ -71,8 +71,9 @@ employees are entitled to or required to do.
 - conditions: only when the excerpt limits the rule to a subgroup or situation, in a few words ("levels L1-L3", "after probation", "primary caregiver"); otherwise null. Do not restate definitions or the topic. Never put a country, region, city or office in conditions, and never a date, year or "from <date>" that only says when the document applies: the document's region and effective date are known separately.
 - quote: the shortest exact span of the excerpt that contains the value and the words that set its strength \
 ("encouraged to attend at least two training sessions", not "two training sessions"), copied character for character.
-- Include rules stated in the negative ("carried forward days do not expire", "sick leave is not paid out", \
-"half days are not allowed"): the value is that short statement copied from the quote ("do not expire on a fixed date").
+- Include rules stated in the negative ("unused gym credits do not roll over", "parking permits are not \
+transferable", "pets are not allowed on site"): the value is that short statement copied from the quote \
+("do not roll over").
 - A rule stated in the negative uses the same attribute as the positive rule it denies, so the two can be \
 compared: "membership fees are never refunded" → attribute "refund deadline", value "never refunded", not \
 attribute "refundability"; "badges never need renewing" → attribute "renewal deadline", not "expiry".
